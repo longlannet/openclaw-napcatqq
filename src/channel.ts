@@ -46,6 +46,7 @@ import {
   evictOldHistoryKeys,
   DEFAULT_GROUP_HISTORY_LIMIT,
   resolveMentionGating,
+  resolvePreferredOpenClawTmpDir,
   type HistoryEntry,
 } from "openclaw/plugin-sdk";
 
@@ -60,12 +61,9 @@ import { normalizeInbound, isMentioningBot, stripBotMention, type NormalizedInbo
 import { sendMessage, getMessage, getLoginInfo } from "./outbound.js";
 import { registerClient, unregisterClient, getClient, requireClient } from "./client-store.js";
 import { getNapCatRuntime } from "./runtime.js";
-import { mkdirSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { join } from "node:path";
 
 // ---------- 配置读取 ----------
 
@@ -146,26 +144,19 @@ const configSchema: ChannelConfigSchema = {
         additionalProperties: {
           type: "object",
           properties: {
+            // ── 连接 ──
             enabled: { type: "boolean" },
             wsUrl: { type: "string", format: "uri" },
             accessToken: { type: "string" },
             selfId: { type: "string" },
-            requireMention: { type: "boolean" },
-            commandPrefix: { type: "string" },
-            defaultTo: { type: "string" },
-            groupPolicy: {
-              type: "string",
-              enum: ["disabled", "open", "allowlist", "pairing"],
-            },
-            groupAllowFrom: {
-              type: "array",
-              items: { oneOf: [{ type: "string" }, { type: "number" }] },
-            },
-            historyLimit: { type: "number" },
+            // ── 管理 ──
             allowFrom: {
               type: "array",
               items: { oneOf: [{ type: "string" }, { type: "number" }] },
             },
+            commandPrefix: { type: "string" },
+            defaultTo: { type: "string" },
+            // ── 私聊 ──
             dm: {
               type: "object",
               properties: {
@@ -179,6 +170,17 @@ const configSchema: ChannelConfigSchema = {
                 },
               },
             },
+            // ── 群聊 ──
+            groupPolicy: {
+              type: "string",
+              enum: ["disabled", "open", "allowlist", "pairing"],
+            },
+            requireMention: { type: "boolean" },
+            groupAllowFrom: {
+              type: "array",
+              items: { oneOf: [{ type: "string" }, { type: "number" }] },
+            },
+            historyLimit: { type: "number" },
           },
           required: ["wsUrl"],
         },
@@ -186,20 +188,25 @@ const configSchema: ChannelConfigSchema = {
     },
   },
   uiHints: {
+    // ── 连接 ──
     "accounts.*.wsUrl": {
-      label: "NapCat WebSocket URL",
+      label: "NapCat WebSocket 地址",
       placeholder: "wss://ncqw.example.com",
+      help: "NapCat 正向 WebSocket 地址（支持 ws:// 和 wss://）",
     },
     "accounts.*.accessToken": {
-      label: "Access Token",
+      label: "访问令牌",
       sensitive: true,
+      help: "OneBot access_token，留空表示无需认证",
     },
     "accounts.*.selfId": {
       label: "机器人 QQ 号",
-      help: "连接成功后自动获取，也可手动填写",
+      help: "连接成功后自动获取，无需手动填写",
     },
-    "accounts.*.requireMention": {
-      label: "群聊需要 @ 才响应",
+    // ── 管理 ──
+    "accounts.*.allowFrom": {
+      label: "管理员 QQ 号",
+      help: "拥有命令权限和审批权限的 QQ 号列表",
     },
     "accounts.*.commandPrefix": {
       label: "命令前缀",
@@ -209,21 +216,34 @@ const configSchema: ChannelConfigSchema = {
       label: "默认发送目标",
       help: "QQ号 或 g群号（message 工具省略 target 时使用）",
     },
-    "accounts.*.groupPolicy": {
-      label: "群聊策略",
-      help: "disabled = 不响应群聊 | open = 响应所有群（需 @）| allowlist = 仅白名单群 | pairing = 新群需审批",
-    },
-    "accounts.*.groupAllowFrom": {
-      label: "群聊白名单",
-      help: "groupPolicy=allowlist 或 pairing 时，已批准的群号列表（格式: g群号）",
-    },
-    "accounts.*.historyLimit": {
-      label: "群聊历史消息上限",
-      help: "群聊中被忽略的消息缓存条数（用于上下文），默认 50",
+    // ── 私聊 ──
+    "accounts.*.dm": {
+      label: "私聊设置",
     },
     "accounts.*.dm.policy": {
-      label: "私聊策略",
-      help: "pairing = 需配对授权 | open = 全部放行 | closed = 全部拒绝",
+      label: "私聊访问策略",
+      help: "pairing = 需管理员审批 | open = 所有人可私聊 | closed = 关闭私聊",
+    },
+    "accounts.*.dm.allowFrom": {
+      label: "已批准的私聊用户",
+      help: "已通过审批的用户 QQ 号（自动维护，也可手动添加）",
+    },
+    // ── 群聊 ──
+    "accounts.*.groupPolicy": {
+      label: "群聊访问策略",
+      help: "disabled = 不响应 | open = 所有群（需@）| allowlist = 仅白名单 | pairing = 新群需审批",
+    },
+    "accounts.*.requireMention": {
+      label: "群聊需要 @ 才响应",
+      help: "开启后机器人只响应被 @ 的消息（推荐大群开启）",
+    },
+    "accounts.*.groupAllowFrom": {
+      label: "已批准的群",
+      help: "已通过审批的群号列表（格式: g群号，自动维护）",
+    },
+    "accounts.*.historyLimit": {
+      label: "群聊历史上下文条数",
+      help: "群聊中未触发的消息缓存条数，作为上下文提供给 Agent，默认 50",
     },
   },
 };
@@ -256,7 +276,7 @@ const config: ChannelConfigAdapter<NapCatAccountConfig> = {
     !account.wsUrl ? "Missing wsUrl (NapCat WebSocket address)" : "",
   resolveAllowFrom: ({ cfg, accountId }) => {
     const account = resolveAccount(cfg, accountId);
-    return account.dm?.allowFrom ?? account.allowFrom;
+    return [...(account.dm?.allowFrom ?? []), ...(account.allowFrom ?? [])];
   },
   formatAllowFrom: ({ allowFrom }) =>
     allowFrom
@@ -613,9 +633,12 @@ const status: ChannelStatusAdapter<NapCatAccountConfig> = {
     accountId: account.accountId,
     enabled: account.enabled,
     configured: !!account.wsUrl,
+    running: runtime?.running ?? false,
     connected: runtime?.connected ?? false,
+    lastStartAt: runtime?.lastStartAt ?? null,
+    lastStopAt: runtime?.lastStopAt ?? null,
+    lastError: runtime?.lastError ?? null,
     bot: runtime?.bot ?? undefined,
-    ...runtime,
   }),
   buildChannelSummary: ({ snapshot }) => {
     const bot = snapshot.bot as { userId?: string; nickname?: string } | undefined;
@@ -629,6 +652,9 @@ const status: ChannelStatusAdapter<NapCatAccountConfig> = {
     };
   },
   collectStatusIssues: (accounts) => {
+    // collectStatusIssues 在 CLI 进程中调用（非 Gateway 进程），
+    // 没有 runtime 状态（running/connected 为 undefined），
+    // 所以只检查配置层面的问题，不检查 runtime 状态。
     const issues: ChannelStatusIssue[] = [];
     for (const a of accounts) {
       if (!a.configured) {
@@ -638,15 +664,6 @@ const status: ChannelStatusAdapter<NapCatAccountConfig> = {
           kind: "config",
           message: "NapCat WebSocket URL not configured",
           fix: `Set channels.napcatqq.accounts.${a.accountId}.wsUrl`,
-        });
-      }
-      if (a.enabled && a.configured && !a.connected && !a.running) {
-        issues.push({
-          channel: CHANNEL_ID,
-          accountId: a.accountId,
-          kind: "runtime",
-          message: "Account enabled but not running",
-          fix: `Check gateway logs or restart: openclaw gateway restart`,
         });
       }
     }
@@ -730,7 +747,7 @@ const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
     function getOwnerIds(): string[] {
       const latestCfg = getNapCatRuntime().config.loadConfig();
       const latestAccount = resolveAccount(latestCfg, accountId);
-      return (latestAccount.dm?.allowFrom ?? latestAccount.allowFrom ?? []).map(String).filter(Boolean);
+      return [...(latestAccount.dm?.allowFrom ?? []), ...(latestAccount.allowFrom ?? [])].map(String).filter(Boolean);
     }
     const historyLimit = Math.max(
       1,
@@ -929,7 +946,7 @@ const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
               void (async () => {
                 try {
                   const core = getNapCatRuntime();
-                  const latestCfg2 = core.config.loadConfig() as any;
+                  const latestCfg2 = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
                   const acctCfg = latestCfg2.channels?.napcatqq?.accounts?.[accountId];
                   if (acctCfg) {
                     const existing = (acctCfg.groupAllowFrom ?? []).map(String);
@@ -960,7 +977,7 @@ const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
               void (async () => {
                 try {
                   const core = getNapCatRuntime();
-                  const latestCfg2 = core.config.loadConfig() as any;
+                  const latestCfg2 = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
                   const acctCfg = latestCfg2.channels?.napcatqq?.accounts?.[accountId];
                   if (acctCfg) {
                     // 写入 dm.allowFrom（与 dm.policy=pairing 配合）
@@ -1031,7 +1048,10 @@ const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
 
       // 3. DM/群聊 访问控制
       const dmPolicy = acct.dm?.policy ?? "pairing";
-      const configuredAllowFrom = (acct.dm?.allowFrom ?? acct.allowFrom ?? []).map(String);
+      const configuredAllowFrom = [
+        ...(acct.dm?.allowFrom ?? []),
+        ...(acct.allowFrom ?? []),
+      ].map(String).filter(Boolean);
 
       // 群聊已在 onEvent 层通过 groupPolicy 过滤，这里统一走 DM 访问控制
       let access: ReturnType<typeof resolveDmGroupAccessWithLists>;
@@ -1146,8 +1166,12 @@ QQ号: ${inbound.senderId}
         return;
       }
 
-      // 5. 语音转写（必须在 finalizeInboundContext 之前完成）
+      // 5. 音频下载到本地（语音转写由 SDK 内部 transcribeFirstAudio 自动处理）
+      const audioMediaPaths: string[] = [];
+      const audioMediaTypes: string[] = [];
       if (inbound.audioUrls.length > 0) {
+        const tmpDir = join(resolvePreferredOpenClawTmpDir(), "napcatqq-audio");
+        mkdirSync(tmpDir, { recursive: true });
         for (const audioUrl of inbound.audioUrls.slice(0, 3)) {
           try {
             const controller = new AbortController();
@@ -1156,38 +1180,14 @@ QQ号: ${inbound.senderId}
             clearTimeout(fetchTimeout);
             if (!resp.ok) continue;
             const buf = Buffer.from(await resp.arrayBuffer());
-            const tmpDir = "/tmp/openclaw/napcatqq-audio";
-            mkdirSync(tmpDir, { recursive: true });
-            const tmpFile = `${tmpDir}/${Date.now()}-${randomBytes(4).toString("hex")}.amr`;
+            const ext = (resp.headers.get("content-type") ?? "").includes("silk") ? ".silk" : ".amr";
+            const tmpFile = `${tmpDir}/${Date.now()}-${randomBytes(4).toString("hex")}${ext}`;
             writeFileSync(tmpFile, buf);
-
-            const whisperPaths = [
-              `${process.env.HOME ?? "/root"}/.openclaw/workspace/skills/whisper-DL/scripts/whisper_transcribe.py`,
-              "/root/.openclaw/workspace/skills/whisper-DL/scripts/whisper_transcribe.py",
-            ];
-            const whisperScript = whisperPaths.find(existsSync);
-            if (!whisperScript) {
-              log?.warn(`[napcatqq] whisper script not found, skipping voice transcription`);
-              try { unlinkSync(tmpFile); } catch { /* ignore */ }
-              continue;
-            }
-
-            const { stdout } = await execFileAsync(
-              "python3",
-              [whisperScript, tmpFile, "--provider", "cf", "--model", "@cf/openai/whisper-large-v3-turbo"],
-              { timeout: 60_000, encoding: "utf-8" }
-            );
-            const transcript = (stdout ?? "").trim();
-            try { unlinkSync(tmpFile); } catch { /* ignore */ }
-
-            if (transcript) {
-              inbound.text = inbound.text.replace("[语音消息]", `[语音转写] ${transcript}`);
-              log?.info(`[napcatqq] voice transcribed: len=${transcript.length}`);
-            } else {
-              log?.warn(`[napcatqq] whisper returned empty transcript`);
-            }
+            audioMediaPaths.push(tmpFile);
+            audioMediaTypes.push(resp.headers.get("content-type")?.split(";")[0].trim() || "audio/amr");
+            log?.info(`[napcatqq] audio downloaded: ${tmpFile} (${buf.length} bytes)`);
           } catch (err) {
-            log?.warn(`[napcatqq] Failed to transcribe voice: ${String(err)}`);
+            log?.warn(`[napcatqq] Failed to download audio: ${String(err)}`);
           }
         }
       }
@@ -1309,6 +1309,9 @@ QQ号: ${inbound.senderId}
         CommandAuthorized: commandGate.commandAuthorized,
         OriginatingChannel: CHANNEL_ID,
         OriginatingTo: inbound.chatId,
+        MediaPaths: audioMediaPaths.length > 0 ? audioMediaPaths : undefined,
+        MediaUrls: audioMediaPaths.length > 0 ? audioMediaPaths : undefined,
+        MediaTypes: audioMediaTypes.length > 0 ? audioMediaTypes : undefined,
       });
 
       // 7. 记录入站会话
@@ -1441,6 +1444,11 @@ QQ号: ${inbound.senderId}
         });
       } catch (err) {
         log?.error(`[napcatqq] Failed to dispatch inbound: ${String(err)}`);
+      } finally {
+        // 清理音频临时文件
+        for (const tmpFile of audioMediaPaths) {
+          try { unlinkSync(tmpFile); } catch { /* ignore */ }
+        }
       }
     }
 
@@ -1516,6 +1524,58 @@ QQ号: ${inbound.senderId}
               ...getStatus(),
               bot: { userId: info.userId, nickname: info.nickname },
             });
+            // 启动后一次性同步：selfId 回写 + pairing store → dm.allowFrom
+            try {
+              const core = getNapCatRuntime();
+              const diskCfg = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
+              const acctCfg = diskCfg?.channels?.napcatqq?.accounts?.[accountId];
+              if (acctCfg) {
+                let needsWrite = false;
+
+                // 回写 selfId
+                if (info.userId && acctCfg.selfId !== info.userId) {
+                  acctCfg.selfId = info.userId;
+                  needsWrite = true;
+                  log?.info(`[napcatqq] selfId written to config: ${info.userId}`);
+                }
+
+                // 同步 credentials pairing store 到 dm.allowFrom
+                const pairingAccess = createScopedPairingAccess({
+                  core,
+                  channel: CHANNEL_ID,
+                  accountId,
+                });
+                const storeAllowFrom = await readStoreAllowFromForDmPolicy({
+                  provider: CHANNEL_ID,
+                  accountId: pairingAccess.accountId,
+                  dmPolicy: "pairing",
+                  readStore: pairingAccess.readStoreForDmPolicy,
+                });
+                if (storeAllowFrom.length > 0) {
+                  acctCfg.dm ??= {};
+                  const existing = new Set((acctCfg.dm.allowFrom ?? []).map(String));
+                  const merged = [...existing];
+                  let added = 0;
+                  for (const id of storeAllowFrom) {
+                    if (!existing.has(id)) {
+                      merged.push(id);
+                      added++;
+                    }
+                  }
+                  if (added > 0) {
+                    acctCfg.dm.allowFrom = merged;
+                    needsWrite = true;
+                    log?.info(`[napcatqq] synced ${added} users from pairing store to dm.allowFrom`);
+                  }
+                }
+
+                if (needsWrite) {
+                  await core.config.writeConfigFile(diskCfg as OpenClawConfig);
+                }
+              }
+            } catch (err) {
+              log?.warn(`[napcatqq] Failed to sync config on startup: ${String(err)}`);
+            }
             break;
           }
         } catch {

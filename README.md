@@ -10,7 +10,7 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 
 - ✅ 私聊 / 群聊收发文本消息
 - ✅ 图片收发（入站：下载转 base64 → Agent ImageContent；出站：URL/base64 发送）
-- ✅ 语音消息自动转写（Cloudflare Workers AI Whisper Large V3 Turbo，AMR 直传无需 ffmpeg）
+- ✅ 语音消息自动转写（委托 SDK `transcribeFirstAudio`，支持 openai / deepgram / google / groq 等多种 provider）
 - ✅ 引用回复（入站提取被引用消息内容和发送者）
 - ✅ 全量消息段解析（23 种 OneBot v11 段类型：表情/视频/文件/位置/卡片/小程序/合并转发等）
 - ✅ Markdown 感知的长消息自动切分（4000 字符限制）
@@ -34,10 +34,12 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 - ✅ 自动重连 + 心跳检测（默认 60 秒超时）
 - ✅ 多账号
 - ✅ `openclaw channels login` 向导式配置（7 步）
-- ✅ 控制面板 JSON Schema 表单渲染
+- ✅ 控制面板 JSON Schema 表单渲染（全中文标签）
 - ✅ 热重载（修改配置后无需重启 Gateway）
 - ✅ `openclaw status` 状态展示（bot 昵称、连接状态、问题诊断）
+- ✅ selfId 自动回写（连接成功后自动将机器人 QQ 号写入配置）
 - ✅ 联系人/群列表目录查询
+- ✅ 启动时自动同步 credentials pairing store 到 `dm.allowFrom` 配置
 
 ### 群聊增强
 
@@ -134,7 +136,7 @@ openclaw gateway restart
 |------|------|--------|------|
 | `wsUrl` | string | **必填** | NapCat WebSocket 地址，如 `wss://ncqq.example.com` |
 | `accessToken` | string | — | OneBot access_token，通过 Authorization Header 传递 |
-| `selfId` | string | 自动获取 | 机器人 QQ 号，连接后自动提取 |
+| `selfId` | string | 自动获取 | 机器人 QQ 号，连接后自动提取并回写到配置 |
 | `requireMention` | boolean | `true` | 群聊是否需要 @机器人 才响应 |
 | `commandPrefix` | string | `"/"` | 命令前缀 |
 | `defaultTo` | string | — | 默认发送目标（message 工具省略 target 时使用） |
@@ -143,9 +145,23 @@ openclaw gateway restart
 | `historyLimit` | number | `50` | 群聊历史消息缓存条数上限 |
 | `allowFrom` | array | — | 管理员/白名单 QQ 号列表 |
 | `dm.policy` | string | `"pairing"` | 私聊策略：`pairing` / `open` / `closed` |
-| `dm.allowFrom` | array | — | 私聊白名单（优先于 `allowFrom`） |
+| `dm.allowFrom` | array | — | 私聊白名单（与 `allowFrom` 合并使用，非互斥） |
 
 ## 访问控制
+
+### allowFrom 合并规则
+
+`dm.allowFrom` 和 `allowFrom` 是**合并关系**，不是覆盖关系。访问控制检查时，两个列表中的 QQ 号都被视为已授权。例如：
+
+```jsonc
+{
+  "allowFrom": ["123456"],       // 管理员
+  "dm": {
+    "allowFrom": ["789012"]      // 已批准的用户
+  }
+}
+// 实际生效的白名单 = ["123456", "789012"]
+```
 
 ### 私聊配对
 
@@ -157,6 +173,8 @@ openclaw gateway restart
    - **QQ 快捷审批**：管理员直接回复 `批准用户 QQ号`
    - **CLI 审批**：`openclaw pairing approve napcatqq <Code>`
 4. 用户收到配对成功通知，后续消息正常路由到 Agent
+
+> **双存储机制**：QQ `批准用户` 命令写入配置文件的 `dm.allowFrom`；CLI `openclaw pairing approve` 写入 `~/.openclaw/credentials/napcatqq-default-allowFrom.json`。插件启动时自动同步 credentials store 到 `dm.allowFrom`，两种方式都有效。
 
 ### 群聊审批
 
@@ -187,9 +205,6 @@ openclaw pairing list napcatqq
 openclaw pairing approve napcatqq <Code>
 ```
 
-已批准用户存储在 `~/.openclaw/credentials/napcatqq-default-allowFrom.json`。
-通过 QQ `批准用户` 命令审批的用户则写入配置文件的 `dm.allowFrom`。
-
 ## 消息支持
 
 ### 入站（QQ → Agent）
@@ -198,7 +213,7 @@ openclaw pairing approve napcatqq <Code>
 |------|---------|
 | 文本 | 直接传递 |
 | 图片 | 下载转 base64 ImageContent（最多 5 张），文本标记 `[图片]` 或 `[图片: 描述]` |
-| 语音 | 自动调用 Whisper 转写为文字，替换 `[语音消息]` 为 `[语音转写] 文字` |
+| 语音 | 下载到本地临时文件 → SDK `transcribeFirstAudio` 自动转写 → 转写完成后清理临时文件 |
 | QQ 表情 | `[QQ表情:ID]` |
 | 商城表情 | 表情摘要如 `[开心]` |
 | 视频 | `[视频消息]` |
@@ -221,16 +236,23 @@ openclaw pairing approve napcatqq <Code>
 
 ### 语音转写配置
 
-需要在 `skills/whisper-DL/config/cloudflare.env` 中配置：
+语音转写由 OpenClaw SDK 内置的 `transcribeFirstAudio` 处理，需要在 `openclaw.json` 中配置音频转写 provider：
 
-```env
-CLOUDFLARE_ACCOUNT_ID=你的AccountID
-CLOUDFLARE_API_TOKEN=你的APIToken
+```jsonc
+{
+  "tools": {
+    "media": {
+      "audio": {
+        "provider": "openai"  // 支持: openai / deepgram / google / groq / minimax 等
+      }
+    }
+  }
+}
 ```
 
-转写流程：QQ 语音(AMR) → 下载 → 写入临时文件 → Whisper Large V3 Turbo → 文字 → 清理临时文件
+转写流程：QQ 语音 → 下载到本地临时文件（自动检测 `.silk` / `.amr` 格式）→ SDK 转写 → 文字 → 自动清理临时文件
 
-如果 Whisper 脚本不存在或转写失败，语音消息保留为 `[语音消息]`，不影响其他功能。
+如果未配置 `tools.media.audio` 或转写失败，语音消息保留为 `[语音消息]`，不影响其他功能。
 
 ## 斜杠命令
 
@@ -319,7 +341,7 @@ location / {
 |--------|------|
 | `meta` | 通道标识、标签、别名 |
 | `capabilities` | 能力声明（支持/不支持的特性） |
-| `configSchema` | JSON Schema + UI Hints（控制面板表单） |
+| `configSchema` | JSON Schema + UI Hints（控制面板中文表单） |
 | `config` | 账号配置读写、allowFrom 解析、defaultTo |
 | `onboarding` | 向导式配置（`openclaw channels login`） |
 | `setup` | 快捷配置（`openclaw channels add`） |
