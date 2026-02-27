@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "declaration": false,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "paths": {
+      "openclaw/plugin-sdk": ["/www/server/nodejs/v24.14.0/lib/node_modules/openclaw/dist/plugin-sdk/plugin-sdk/index.d.ts"]
+    },
+    "baseUrl": "."
+  },
+  "include": ["index.ts", "src/**/*.ts"]
+}

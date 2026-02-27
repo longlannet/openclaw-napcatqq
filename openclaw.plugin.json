@@ -1,0 +1,11 @@
+{
+  "id": "napcatqq",
+  "channels": ["napcatqq"],
+  "name": "NapCatQQ",
+  "description": "Connect OpenClaw to QQ via NapCatQQ (OneBot v11 WebSocket)",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
