@@ -1,6 +1,6 @@
 {
   "name": "napcatqq",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "OpenClaw QQ channel plugin via NapCatQQ (OneBot v11 WebSocket)",
   "openclaw": {
