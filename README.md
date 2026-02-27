@@ -64,13 +64,13 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 ### 从 GitHub 安装
 
 ```bash
-openclaw plugins install github:用户名/openclaw-napcatqq
+openclaw plugins install github:longlannet/openclaw-napcatqq
 ```
 
 ### 从本地目录安装（开发模式）
 
 ```bash
-git clone https://github.com/用户名/openclaw-napcatqq.git
+git clone https://github.com/longlannet/openclaw-napcatqq.git
 openclaw plugins install ./openclaw-napcatqq --link
 ```
 
