@@ -219,10 +219,46 @@ export interface OneBotNoticeEvent {
   sub_type?: string;
   self_id: number;
   time: number;
+  group_id?: number;
+  user_id?: number;
+  operator_id?: number;
   [key: string]: unknown;
 }
 
-export type OneBotEvent = OneBotMessageEvent | OneBotMetaEvent | OneBotNoticeEvent;
+// ---------- 请求事件 ----------
+export interface OneBotRequestEvent {
+  post_type: "request";
+  request_type: "friend" | "group";
+  sub_type?: string;          // group: "add" | "invite"
+  user_id: number;
+  group_id?: number;
+  comment?: string;           // 验证消息
+  flag: string;               // 请求标识（用于同意/拒绝）
+  self_id: number;
+  time: number;
+}
+
+// ---------- 机器人自发消息事件 ----------
+export interface OneBotMessageSentEvent {
+  post_type: "message_sent";
+  message_type: "private" | "group";
+  sub_type: string;
+  message_id: number;
+  user_id: number;
+  group_id?: number;
+  message: OneBotSegment[] | string;
+  raw_message: string;
+  sender: {
+    user_id: number;
+    nickname: string;
+    card?: string;
+  };
+  self_id: number;
+  time: number;
+  target_id?: number;         // 私聊目标 QQ 号
+}
+
+export type OneBotEvent = OneBotMessageEvent | OneBotMetaEvent | OneBotNoticeEvent | OneBotRequestEvent | OneBotMessageSentEvent;
 
 // ---------- API 调用 ----------
 export interface OneBotApiRequest {
@@ -255,4 +291,8 @@ export interface NapCatAccountConfig {
     policy?: string;
     allowFrom?: Array<string | number>;
   };
+  // ── v0.5 新增 ──
+  autoAcceptFriend?: boolean;       // 自动同意好友请求（默认 false）
+  autoAcceptGroupInvite?: boolean;  // 自动同意入群邀请（默认 false）
+  emojiAck?: boolean;               // 收到消息时打表情回应（默认 false）
 }

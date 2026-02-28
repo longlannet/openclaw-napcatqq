@@ -50,6 +50,10 @@ export const configSchema: ChannelConfigSchema = {
               items: { oneOf: [{ type: "string" }, { type: "number" }] },
             },
             historyLimit: { type: "number" },
+            // ── v0.5 新增 ──
+            autoAcceptFriend: { type: "boolean" },
+            autoAcceptGroupInvite: { type: "boolean" },
+            emojiAck: { type: "boolean" },
           },
           required: ["wsUrl"],
         },
@@ -113,6 +117,19 @@ export const configSchema: ChannelConfigSchema = {
     "accounts.*.historyLimit": {
       label: "群聊历史上下文条数",
       help: "群聊中未触发的消息缓存条数，作为上下文提供给 Agent，默认 50",
+    },
+    // ── v0.5 新增 ──
+    "accounts.*.autoAcceptFriend": {
+      label: "自动同意好友请求",
+      help: "开启后机器人会自动同意所有好友请求（默认关闭）",
+    },
+    "accounts.*.autoAcceptGroupInvite": {
+      label: "自动同意入群邀请",
+      help: "开启后机器人被邀请入群时自动同意（默认关闭）",
+    },
+    "accounts.*.emojiAck": {
+      label: "消息表情回应",
+      help: "收到消息时自动打表情（处理中 → 完成），默认关闭",
     },
   },
 };

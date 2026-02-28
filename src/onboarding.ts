@@ -127,6 +127,39 @@ export const onboarding: ChannelOnboardingAdapter = {
       nextCfg.channels.napcatqq.accounts[accountId].requireMention = requireMention === "true";
     }
 
+    // 8. 自动同意好友请求
+    const autoAcceptFriend = await prompter.select<string>({
+      message: "自动同意好友请求？",
+      options: [
+        { value: "false", label: "否（默认，需要手动同意好友请求）" },
+        { value: "true", label: "是（不然陌生人无法私聊机器人）" },
+      ],
+      initialValue: "false",
+    });
+    nextCfg.channels.napcatqq.accounts[accountId].autoAcceptFriend = autoAcceptFriend === "true";
+
+    // 9. 自动同意入群邀请
+    const autoAcceptGroupInvite = await prompter.select<string>({
+      message: "自动同意入群邀请？",
+      options: [
+        { value: "false", label: "否（默认，需要手动同意入群邀请）" },
+        { value: "true", label: "是（入群后仍需通过 groupPolicy 审批才会响应）" },
+      ],
+      initialValue: "false",
+    });
+    nextCfg.channels.napcatqq.accounts[accountId].autoAcceptGroupInvite = autoAcceptGroupInvite === "true";
+
+    // 10. 消息表情回应
+    const emojiAck = await prompter.select<string>({
+      message: "收到消息时自动打表情回应？",
+      options: [
+        { value: "false", label: "否（默认，安静模式）" },
+        { value: "true", label: "是（收到消息打❤️，表示正在处理）" },
+      ],
+      initialValue: "false",
+    });
+    nextCfg.channels.napcatqq.accounts[accountId].emojiAck = emojiAck === "true";
+
     return { cfg: nextCfg as OpenClawConfig, accountId };
   },
 

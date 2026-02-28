@@ -19,10 +19,16 @@ import {
   type HistoryEntry,
 } from "openclaw/plugin-sdk";
 import type { NapCatAccountConfig } from "./types.js";
-import type { OneBotMessageEvent } from "./types.js";
+import type { OneBotMessageEvent, OneBotRequestEvent, OneBotNoticeEvent, OneBotMessageSentEvent } from "./types.js";
 import { NapCatWsClient } from "./ws-client.js";
 import { normalizeInbound, isMentioningBot, stripBotMention, type NormalizedInbound } from "./inbound.js";
-import { sendMessage, getLoginInfo } from "./outbound.js";
+import {
+  sendMessage, getLoginInfo,
+  setFriendAddRequest, setGroupAddRequest,
+  markPrivateMsgAsRead, markGroupMsgAsRead,
+  setMsgEmojiLike,
+  getGroupMsgHistory,
+} from "./outbound.js";
 import { registerClient, unregisterClient, getClient } from "./client-store.js";
 import { getNapCatRuntime } from "./runtime.js";
 import { CHANNEL_ID, resolveAccount } from "./config.js";
@@ -125,8 +131,207 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
           return;
         }
 
-        // 通知事件：暂不处理
+        // 通知事件
         if (event.post_type === "notice") {
+          const notice = event as OneBotNoticeEvent;
+
+          // kick_me — 机器人被踢出群 → 自动从 groupAllowFrom 移除
+          if (notice.notice_type === "group_decrease" && notice.sub_type === "kick_me" && notice.group_id) {
+            const gid = String(notice.group_id);
+            log?.warn(`[napcatqq] Bot kicked from group ${gid}`);
+            approvedGroups.delete(gid);
+            approvedGroups.delete(`g${gid}`);
+            notifiedGroups.delete(gid);
+
+            // 持久化移除（async fire-and-forget）
+            void (async () => {
+              try {
+                const core = getNapCatRuntime();
+                const diskCfg = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
+                const acctCfg = diskCfg?.channels?.napcatqq?.accounts?.[accountId];
+                if (acctCfg?.groupAllowFrom) {
+                  const before = acctCfg.groupAllowFrom.length;
+                  acctCfg.groupAllowFrom = acctCfg.groupAllowFrom.filter(
+                    (e: string | number) => String(e) !== gid && String(e) !== `g${gid}`,
+                  );
+                  if (acctCfg.groupAllowFrom.length < before) {
+                    await core.config.writeConfigFile(diskCfg as OpenClawConfig);
+                    log?.info(`[napcatqq] Removed group ${gid} from groupAllowFrom`);
+                  }
+                }
+              } catch (err) {
+                log?.warn(`[napcatqq] Failed to remove kicked group: ${String(err)}`);
+              }
+              // 通知管理员
+              for (const ownerId of getOwnerIds()) {
+                try {
+                  await sendMessage(client, {
+                    chatType: "direct",
+                    userId: ownerId,
+                    text: `⚠️ 机器人已被移出群 ${gid}，已自动从 groupAllowFrom 中移除。`,
+                  });
+                } catch { /* ignore */ }
+              }
+            })();
+          }
+
+          // group_ban — 机器人被禁言 → 通知管理员
+          if (notice.notice_type === "group_ban" && notice.sub_type === "ban" && notice.group_id) {
+            const bannedUserId = notice.user_id ? String(notice.user_id) : "";
+            // 只在机器人自己被禁言时通知
+            if ((bannedUserId && bannedUserId === selfId) || (!bannedUserId && notice.self_id && String(notice.self_id) === selfId)) {
+              const gid = String(notice.group_id);
+              const duration = notice.duration ? Number(notice.duration) : 0;
+              const durationText = duration === 0 ? "永久" : `${duration}秒`;
+              const operatorId = notice.operator_id ? String(notice.operator_id) : "未知";
+              log?.warn(`[napcatqq] Bot muted in group ${gid} for ${durationText} by ${operatorId}`);
+              void (async () => {
+                for (const ownerId of getOwnerIds()) {
+                  try {
+                    await sendMessage(client, {
+                      chatType: "direct",
+                      userId: ownerId,
+                      text: `⚠️ 机器人在群 ${gid} 被禁言\n时长: ${durationText}\n操作者: ${operatorId}`,
+                    });
+                  } catch { /* ignore */ }
+                }
+              })();
+            }
+          }
+
+          // friend_add — 新好友添加成功
+          if (notice.notice_type === "friend_add" && notice.user_id) {
+            const uid = String(notice.user_id);
+            log?.info(`[napcatqq] New friend added: ${uid}`);
+            void (async () => {
+              for (const ownerId of getOwnerIds()) {
+                try {
+                  await sendMessage(client, {
+                    chatType: "direct",
+                    userId: ownerId,
+                    text: `ℹ️ 新好友添加成功: ${uid}`,
+                  });
+                } catch { /* ignore */ }
+              }
+            })();
+          }
+
+          // notify.poke — 戳一戳事件（记录但不触发回复）
+          if (notice.notice_type === "notify" && notice.sub_type === "poke") {
+            log?.info(`[napcatqq] Poke event: ${notice.user_id} poked ${notice.target_id ?? "someone"} in ${notice.group_id ?? "private"}`);
+          }
+
+          // bot_offline — 机器人离线通知
+          if (notice.notice_type === "bot_offline") {
+            const tag = notice.tag ? String(notice.tag) : "";
+            const message = notice.message ? String(notice.message) : "";
+            log?.warn(`[napcatqq] Bot offline: ${tag} ${message}`);
+            void (async () => {
+              for (const ownerId of getOwnerIds()) {
+                try {
+                  await sendMessage(client, {
+                    chatType: "direct",
+                    userId: ownerId,
+                    text: `⚠️ 机器人离线: ${tag} ${message}`.trim(),
+                  });
+                } catch { /* ignore */ }
+              }
+            })();
+          }
+
+          return;
+        }
+
+        // 请求事件
+        if (event.post_type === "request") {
+          const req = event as OneBotRequestEvent;
+          const latestCfg = getNapCatRuntime().config.loadConfig();
+          const latestAccount = resolveAccount(latestCfg, accountId);
+
+          // 好友请求 → 自动同意
+          if (req.request_type === "friend") {
+            const autoAccept = latestAccount.autoAcceptFriend === true; // 默认 false
+            log?.info(`[napcatqq] Friend request from ${req.user_id}, comment="${req.comment ?? ""}", autoAccept=${autoAccept}`);
+            if (autoAccept) {
+              void (async () => {
+                const ok = await setFriendAddRequest(client, req.flag, true);
+                if (ok) {
+                  log?.info(`[napcatqq] Auto-accepted friend request from ${req.user_id}`);
+                  // 通知管理员
+                  for (const ownerId of getOwnerIds()) {
+                    try {
+                      await sendMessage(client, {
+                        chatType: "direct",
+                        userId: ownerId,
+                        text: `ℹ️ 已自动同意好友请求: ${req.user_id}${req.comment ? ` (验证消息: ${req.comment})` : ""}`,
+                      });
+                    } catch { /* ignore */ }
+                  }
+                } else {
+                  log?.warn(`[napcatqq] Failed to accept friend request from ${req.user_id}`);
+                }
+              })();
+            }
+          }
+
+          // 入群邀请 → 自动同意
+          if (req.request_type === "group" && req.sub_type === "invite") {
+            const autoAccept = latestAccount.autoAcceptGroupInvite === true; // 默认 false
+            log?.info(`[napcatqq] Group invite to ${req.group_id} from ${req.user_id}, autoAccept=${autoAccept}`);
+            if (autoAccept) {
+              void (async () => {
+                const ok = await setGroupAddRequest(client, req.flag, "invite", true);
+                if (ok) {
+                  log?.info(`[napcatqq] Auto-accepted group invite to ${req.group_id}`);
+                  // 通知管理员
+                  for (const ownerId of getOwnerIds()) {
+                    try {
+                      await sendMessage(client, {
+                        chatType: "direct",
+                        userId: ownerId,
+                        text: `ℹ️ 已自动同意入群邀请: 群${req.group_id} (邀请人: ${req.user_id})`,
+                      });
+                    } catch { /* ignore */ }
+                  }
+                } else {
+                  log?.warn(`[napcatqq] Failed to accept group invite to ${req.group_id}`);
+                }
+              })();
+            }
+          }
+          return;
+        }
+
+        // message_sent — 记录机器人自发消息（需 NapCat 开启 reportSelfMessage）
+        if (event.post_type === "message_sent") {
+          const sentEvent = event as OneBotMessageSentEvent;
+          const chatId = sentEvent.message_type === "group"
+            ? `napcatqq:g${sentEvent.group_id}`
+            : `napcatqq:${sentEvent.target_id ?? sentEvent.user_id}`;
+          const textContent = typeof sentEvent.message === "string"
+            ? sentEvent.message
+            : Array.isArray(sentEvent.message)
+              ? sentEvent.message.filter((s: any) => s.type === "text").map((s: any) => s.data?.text ?? "").join("")
+              : sentEvent.raw_message ?? "";
+
+          if (textContent.trim()) {
+            // 群聊：记入 groupHistories，让 Agent 知道自己说过什么
+            if (sentEvent.message_type === "group" && sentEvent.group_id) {
+              const botName = sentEvent.sender?.nickname || selfId || "Bot";
+              recordPendingHistoryEntryIfEnabled({
+                historyMap: groupHistories,
+                historyKey: chatId,
+                entry: {
+                  sender: `${botName}(Bot)`,
+                  body: textContent.trim(),
+                  timestamp: Date.now(),
+                  messageId: String(sentEvent.message_id),
+                },
+                limit: historyLimit,
+              });
+            }
+            log?.info(`[napcatqq] message_sent recorded: chatId=${chatId} textLen=${textContent.length}`);
+          }
           return;
         }
 
@@ -139,6 +344,12 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
 
           // 忽略机器人自己发的消息（防止回环）
           if (selfId && inbound.senderId === selfId) {
+            return;
+          }
+
+          // 忽略空消息（无文本、无图片、无音频、无视频、无文件 — 可能是客户端操作触发的空事件）
+          if (!inbound.text.trim() && inbound.imageUrls.length === 0 && inbound.audioUrls.length === 0 && inbound.videoUrls.length === 0 && inbound.fileInfos.length === 0) {
+            log?.info(`[napcatqq] dropping empty message from ${inbound.senderId}`);
             return;
           }
 
@@ -360,7 +571,7 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
       },
       shouldDebounce: (item) => {
         if (!item.text.trim()) return false;
-        if (item.imageUrls.length > 0 || item.audioUrls.length > 0) return false;
+        if (item.imageUrls.length > 0 || item.audioUrls.length > 0 || item.videoUrls.length > 0 || item.fileInfos.length > 0) return false;
         const core = getNapCatRuntime();
         const latestCfg = core.config.loadConfig();
         return !core.channel.text.hasControlCommand(item.text, latestCfg);
@@ -467,6 +678,65 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
             } catch (err) {
               log?.warn(`[napcatqq] Failed to sync config on startup: ${String(err)}`);
             }
+
+            // 启动时加载已批准群的历史消息（恢复重启前的上下文）
+            try {
+              const latestCfg3 = getNapCatRuntime().config.loadConfig();
+              const latestAccount3 = resolveAccount(latestCfg3, accountId);
+              const groupIds = (latestAccount3.groupAllowFrom ?? [])
+                .map(String)
+                .map((e) => e.startsWith("g") ? e.slice(1) : e)
+                .filter((e) => /^\d+$/.test(e));
+
+              if (groupIds.length > 0) {
+                log?.info(`[napcatqq] Loading history for ${groupIds.length} approved groups...`);
+                const loadCount = Math.min(historyLimit, 50); // 最多加载 50 条
+                for (const gid of groupIds) {
+                  try {
+                    const messages = await getGroupMsgHistory(client, gid, loadCount);
+                    if (messages.length > 0) {
+                      const chatId = `napcatqq:g${gid}`;
+                      // 按时间顺序插入，跳过机器人自己的消息
+                      const botId = selfId;
+                      for (const msg of messages) {
+                        if (botId && String(msg.user_id) === botId) {
+                          // 机器人自己的消息也记录（带 Bot 标记）
+                          recordPendingHistoryEntryIfEnabled({
+                            historyMap: groupHistories,
+                            historyKey: chatId,
+                            entry: {
+                              sender: `${msg.nickname}(Bot)`,
+                              body: msg.content,
+                              timestamp: msg.time * 1000,
+                              messageId: String(msg.message_id),
+                            },
+                            limit: historyLimit,
+                          });
+                        } else if (msg.content.trim()) {
+                          recordPendingHistoryEntryIfEnabled({
+                            historyMap: groupHistories,
+                            historyKey: chatId,
+                            entry: {
+                              sender: msg.nickname,
+                              body: msg.content,
+                              timestamp: msg.time * 1000,
+                              messageId: String(msg.message_id),
+                            },
+                            limit: historyLimit,
+                          });
+                        }
+                      }
+                      log?.info(`[napcatqq] Loaded ${messages.length} history messages for group ${gid}`);
+                    }
+                  } catch (err) {
+                    log?.warn(`[napcatqq] Failed to load history for group ${gid}: ${String(err)}`);
+                  }
+                }
+              }
+            } catch (err) {
+              log?.warn(`[napcatqq] Failed to load group histories on startup: ${String(err)}`);
+            }
+
             break;
           }
         } catch {

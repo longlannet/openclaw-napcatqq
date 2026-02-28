@@ -20,7 +20,7 @@ import {
 } from "openclaw/plugin-sdk";
 import type { NormalizedInbound } from "./inbound.js";
 import { isMentioningBot } from "./inbound.js";
-import { sendMessage, getMessage } from "./outbound.js";
+import { sendMessage, getMessage, setMsgEmojiLike, markPrivateMsgAsRead, markGroupMsgAsRead } from "./outbound.js";
 import { getClient } from "./client-store.js";
 import { getNapCatRuntime } from "./runtime.js";
 import { CHANNEL_ID, resolveAccount } from "./config.js";
@@ -53,18 +53,36 @@ export async function handleInboundMessage(
   const latestCfg = core.config.loadConfig();
 
   // 1. 路由解析
+  // peer.id 不带 channel 前缀 — SDK 内部会自动拼接 channel:peerKind:peerId
+  const peerId = inbound.chatId.replace(/^napcatqq:/i, "");
   const route = core.channel.routing.resolveAgentRoute({
     cfg: latestCfg,
     channel: CHANNEL_ID,
     accountId,
     peer: {
       kind: inbound.chatType,
-      id: inbound.chatId,
+      id: peerId,
     },
   });
 
   // 2. 账号配置
   const acct = resolveAccount(latestCfg, accountId);
+
+  // 2b. 标记已读（fire-and-forget）
+  if (client) {
+    if (inbound.chatType === "group" && inbound.groupId) {
+      void markGroupMsgAsRead(client, inbound.groupId).catch(() => {});
+    } else if (inbound.chatType === "direct") {
+      void markPrivateMsgAsRead(client, inbound.senderId).catch(() => {});
+    }
+  }
+
+  // 2c. Emoji ack（收到消息时打表情回应 — 处理中）
+  const emojiAckEnabled = acct.emojiAck === true;
+  if (emojiAckEnabled && client) {
+    // 66 = 爱心，表示"收到/处理中"
+    void setMsgEmojiLike(client, inbound.messageId, "66").catch(() => {});
+  }
 
   // 3. DM/群聊 访问控制
   const dmPolicy = acct.dm?.policy ?? "pairing";
@@ -206,6 +224,21 @@ export async function handleInboundMessage(
     }
   }
 
+  // 5b. 视频 URL（不下载，将 URL 信息附加给 Agent 参考）
+  if (inbound.videoUrls.length > 0) {
+    if (inbound.videoUrls.length === 1) {
+      inbound.text = inbound.text.replace("[视频消息]", `[视频消息: ${inbound.videoUrls[0]}]`);
+    } else {
+      // 多视频：替换所有 [视频消息] 为带序号和 URL 的版本
+      let videoIdx = 0;
+      inbound.text = inbound.text.replace(/\[视频消息\]/g, () => {
+        const url = inbound.videoUrls[videoIdx] ?? "";
+        videoIdx++;
+        return url ? `[视频${videoIdx}: ${url}]` : `[视频${videoIdx}]`;
+      });
+    }
+  }
+
   // 6. 构建并最终化入站上下文
   const isGroup = inbound.chatType === "group";
   const groupName = inbound.raw.group_name;
@@ -225,7 +258,7 @@ export async function handleInboundMessage(
     }
   }
 
-  // envelope 格式化（给 Body 加上时间戳/来源信封）
+  // envelope 格式化
   const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(latestCfg);
   const storePath = core.channel.session.resolveStorePath(latestCfg.session?.store, {
     agentId: route.agentId,
@@ -235,26 +268,28 @@ export async function handleInboundMessage(
     sessionKey: route.sessionKey,
   });
   const envelopeFrom = isGroup
-    ? `${inbound.senderName}@${groupName || `群${inbound.groupId}`}`
-    : inbound.senderName;
-  const body = core.channel.reply.formatAgentEnvelope({
+    ? `${groupName || `群${inbound.groupId}`} (qq-group:${inbound.groupId})`
+    : `${inbound.senderName} (qq:${inbound.senderId})`;
+  const body = core.channel.reply.formatInboundEnvelope({
     channel: "QQ",
     from: envelopeFrom,
     timestamp: new Date(),
     previousTimestamp,
     envelope: envelopeOptions,
     body: inbound.text,
+    chatType: inbound.chatType,
+    senderLabel: inbound.senderName,
   });
 
-  // system event 入队
-  const preview = inbound.text.replace(/\s+/g, " ").slice(0, 160);
-  const inboundLabel = isGroup
-    ? `QQ message in ${groupName || `群${inbound.groupId}`} from ${inbound.senderName}`
-    : `QQ DM from ${inbound.senderName}`;
-  core.system.enqueueSystemEvent(`${inboundLabel}: ${preview}`, {
-    sessionKey: route.sessionKey,
-    contextKey: `napcatqq:message:${inbound.chatId}:${inbound.messageId}`,
-  });
+  // system event 入队（仅群聊 — Telegram 普通消息入站也不调此函数）
+  if (isGroup) {
+    const preview = inbound.text.replace(/\s+/g, " ").slice(0, 160);
+    const inboundLabel = `QQ message in ${groupName || `群${inbound.groupId}`} from ${inbound.senderName}`;
+    core.system.enqueueSystemEvent(`${inboundLabel}: ${preview}`, {
+      sessionKey: route.sessionKey,
+      contextKey: `napcatqq:message:${inbound.chatId}:${inbound.messageId}`,
+    });
+  }
 
   // 6c. 群聊历史上下文（收集被忽略的消息作为上下文提供给 Agent）
   let combinedBody = body;
@@ -298,18 +333,18 @@ export async function handleInboundMessage(
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: combinedBody,
-    BodyForAgent: combinedBody,
+    BodyForAgent: inbound.text,
     RawBody: inbound.text,
     CommandBody: inbound.text,
     BodyForCommands: inbound.text,
     InboundHistory: inboundHistory,
-    From: inbound.senderId,
-    To: inbound.chatId,
+    From: isGroup ? `qq-group:${inbound.groupId}` : `qq:${inbound.senderId}`,
+    To: isGroup ? `qq-group:${inbound.groupId}` : `qq:${inbound.senderId}`,
     SessionKey: route.sessionKey,
     AccountId: route.accountId,
     ChatType: inbound.chatType,
     ConversationLabel: envelopeFrom,
-    GroupSubject: isGroup ? (groupName || `群${inbound.groupId}`) : undefined,
+    GroupSubject: isGroup ? (groupName ? `${groupName} (${inbound.groupId})` : `群${inbound.groupId}`) : undefined,
     SenderName: inbound.senderName,
     SenderId: inbound.senderId,
     Provider: CHANNEL_ID,
@@ -324,7 +359,7 @@ export async function handleInboundMessage(
     OriginatingChannel: CHANNEL_ID,
     OriginatingTo: inbound.chatId,
     MediaPaths: audioMediaPaths.length > 0 ? audioMediaPaths : undefined,
-    MediaUrls: audioMediaPaths.length > 0 ? audioMediaPaths : undefined,
+    MediaUrls: inbound.audioUrls.length > 0 ? inbound.audioUrls : undefined,
     MediaTypes: audioMediaTypes.length > 0 ? audioMediaTypes : undefined,
   });
 
@@ -395,12 +430,22 @@ export async function handleInboundMessage(
         const replyTargetId = isGroupReply ? replyTo.slice(1) : replyTo;
 
         if (payload.text || payload.mediaUrl) {
+          // 检测媒体类型
+          const mediaUrl = payload.mediaUrl ?? "";
+          const mimeType = (payload as any).mediaContentType ?? "";
+          const isAudio = mimeType.startsWith("audio/") ||
+            /\.(mp3|ogg|wav|amr|silk|m4a|flac|aac)$/i.test(mediaUrl);
+          const isVideo = mimeType.startsWith("video/") ||
+            /\.(mp4|avi|mkv|mov|webm)$/i.test(mediaUrl);
+
           const result = await sendMessage(replyClient, {
             chatType: isGroupReply ? "group" : "direct",
             userId: isGroupReply ? undefined : replyTargetId,
             groupId: isGroupReply ? replyTargetId : undefined,
             text: payload.text || undefined,
-            imageUrl: payload.mediaUrl,
+            imageUrl: (!isAudio && !isVideo) ? mediaUrl || undefined : undefined,
+            voiceUrl: isAudio ? mediaUrl : undefined,
+            videoUrl: isVideo ? mediaUrl : undefined,
           });
           if (!result.ok) {
             throw new Error(`sendMessage failed: ${result.error}`);

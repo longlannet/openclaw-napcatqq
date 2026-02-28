@@ -87,6 +87,13 @@ export class NapCatWsClient {
       this.ws = null;
     }
 
+    // 拒绝所有等待中的 API 调用（旧连接的回包不会再来了）
+    for (const [echo, p] of this.pendingCalls) {
+      clearTimeout(p.timer);
+      p.reject(new Error("WebSocket reconnecting"));
+    }
+    this.pendingCalls.clear();
+
     this.opts.logger.info(`[napcatqq] Connecting to ${this.opts.wsUrl} ...`);
 
     // token 通过 Authorization header 传递，不暴露在 URL 里
@@ -108,8 +115,14 @@ export class NapCatWsClient {
 
     ws.on("message", (raw: Buffer | string) => {
       this.resetHeartbeatTimer();
+      let data: any;
       try {
-        const data = JSON.parse(raw.toString());
+        data = JSON.parse(raw.toString());
+      } catch (e) {
+        this.opts.logger.warn("[napcatqq] Failed to parse WS message:", e);
+        return;
+      }
+      try {
         // API 回包（有 echo）
         if (data.echo && this.pendingCalls.has(data.echo)) {
           const p = this.pendingCalls.get(data.echo)!;
@@ -123,7 +136,7 @@ export class NapCatWsClient {
           this.opts.onEvent(data as OneBotEvent);
         }
       } catch (e) {
-        this.opts.logger.warn("[napcatqq] Failed to parse message:", e);
+        this.opts.logger.error("[napcatqq] Event handler error:", e);
       }
     });
 

@@ -2,38 +2,81 @@
 
 OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCatQQ)（OneBot v11 WebSocket）对接 QQ。
 
-与官方 Telegram / Discord / 飞书 等通道插件完全对齐，实现了 OpenClaw ChannelPlugin SDK 的全部 14 个适配器。
+与官方 Telegram / Discord / 飞书等通道插件完全对齐，实现了 OpenClaw ChannelPlugin SDK 的全部 14 个适配器 + 10 个消息 Action。
 
 ## 功能
 
 ### 消息能力
 
 - ✅ 私聊 / 群聊收发文本消息
-- ✅ 图片收发（入站：下载转 base64 → Agent ImageContent；出站：URL/base64 发送）
-- ✅ 语音消息自动转写（委托 SDK `transcribeFirstAudio`，支持 openai / deepgram / google / groq 等多种 provider）
-- ✅ 引用回复（入站提取被引用消息内容和发送者）
+- ✅ 图片收发（入站：下载转 base64 → Agent ImageContent，最多 5 张；出站：URL/base64 发送）
+- ✅ 多图发送（Agent 返回多张图片时自动逐张发送）
+- ✅ 语音收发（入站：自动下载转写；出站：`record` 消息段独立发送）
+- ✅ 视频消息解析（入站：URL 附加到文本供 Agent 参考）
+- ✅ 语音转写（委托 SDK `transcribeFirstAudio`，支持 openai / deepgram / google / groq 等 provider）
+- ✅ 引用回复（入站：提取被引用消息内容和发送者；出站：`[[reply_to:xxx]]` 标签）
+- ✅ 文件发送（`sendAttachment` action，通过 `base64://` 前缀跨服务器传输）
 - ✅ 全量消息段解析（23 种 OneBot v11 段类型：表情/视频/文件/位置/卡片/小程序/合并转发等）
+- ✅ QQ 表情 → Unicode Emoji 映射（130+ 个 face ID 双向映射）
+- ✅ 合并转发消息展开（解析前 5 条转发内容含发送者名称）
 - ✅ Markdown 感知的长消息自动切分（4000 字符限制）
 - ✅ Typing 输入状态指示（私聊显示"正在输入"，NapCat `set_input_status` API）
+
+### 消息 Action（10 个）
+
+| Action | 说明 |
+|--------|------|
+| `send` | 主动发消息（指定目标 QQ 号或 `g群号`） |
+| `reply` | 引用回复指定消息 |
+| `react` | 消息表情回应（`set_msg_emoji_like`，默认 👍） |
+| `unsend` | 撤回消息 |
+| `delete` | 删除消息（同 unsend） |
+| `read` | 标记消息已读 |
+| `sendAttachment` | 发送文件（私聊/群聊） |
+| `member-info` | 查询群成员信息（角色/头衔/等级） |
+| `pin` | 设为精华消息 |
+| `unpin` | 取消精华消息 |
 
 ### 访问控制
 
 - ✅ 私聊配对认证（pairing）— 新用户需管理员审批
-- ✅ 私聊 QQ 快捷审批 — 管理员直接回复 `批准用户 QQ号` 即可
+- ✅ 私聊 QQ 快捷审批 — 管理员直接回复 `批准用户 QQ号`
 - ✅ 群聊配对审批（pairing）— 新群需管理员批准
-- ✅ 群聊 QQ 快捷审批 — 管理员直接回复 `批准群 群号` 即可
+- ✅ 群聊 QQ 快捷审批 — 管理员直接回复 `批准群 群号`
 - ✅ 群聊 @机器人 过滤（可配置）
 - ✅ 群聊白名单（allowlist）/ 全开放（open）/ 关闭（disabled）
 - ✅ `/model` `/status` `/reset` 等斜杠命令（权限基于 allowFrom）
-- ✅ 控制命令拦截（未授权用户发控制命令会被静默丢弃）
+- ✅ 控制命令拦截（未授权用户发控制命令静默丢弃）
+
+### 事件处理
+
+- ✅ `notice.group_decrease.kick_me` — 机器人被踢出群自动清理 + 通知管理员
+- ✅ `notice.group_ban.ban` — 机器人被禁言检测 + 通知管理员（含时长/操作者）
+- ✅ `notice.friend_add` — 新好友添加通知管理员
+- ✅ `request.friend` — 好友请求处理（`autoAcceptFriend` 开关，默认关闭）
+- ✅ `request.group.invite` — 入群邀请处理（`autoAcceptGroupInvite` 开关，默认关闭）
+- ✅ `message_sent` — 机器人自发消息记入群聊历史上下文
+- ✅ `bot_offline` — 机器人离线通知管理员
+- ✅ `notify.poke` — 戳一戳事件日志记录
+- ✅ 收到消息自动标记已读（`mark_msg_as_read`）
+- ✅ 收到消息可选表情回应（`emojiAck` 开关）
+
+### 群聊增强
+
+- ✅ 群聊历史上下文（被忽略的消息作为 Agent 上下文）
+- ✅ 启动时预加载已批准群的历史消息（`get_group_msg_history`）
+- ✅ 消息防抖合并（连续多条消息合并为一条处理）
+- ✅ Agent 信封格式（`发送者@群名`，含时间戳）
+- ✅ 群聊工具权限策略
 
 ### 连接与管理
 
 - ✅ WSS 支持（宝塔 / Nginx HTTPS 反代）
 - ✅ Token 通过 `Authorization: Bearer` Header 传递（不暴露在 URL）
 - ✅ 自动重连 + 心跳检测（默认 60 秒超时）
+- ✅ 重连时自动清理挂起的 API 调用
 - ✅ 多账号
-- ✅ `openclaw channels login` 向导式配置（7 步）
+- ✅ `openclaw channels login` 向导式配置（10 步）
 - ✅ 控制面板 JSON Schema 表单渲染（全中文标签）
 - ✅ 热重载（修改配置后无需重启 Gateway）
 - ✅ `openclaw status` 状态展示（bot 昵称、连接状态、问题诊断）
@@ -41,24 +84,24 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 - ✅ 联系人/群列表目录查询
 - ✅ 启动时自动同步 credentials pairing store 到 `dm.allowFrom` 配置
 
-### 群聊增强
+### 能力声明
 
-- ✅ 群聊历史上下文（被忽略的消息作为 Agent 上下文）
-- ✅ 消息防抖合并（连续多条消息合并为一条处理）
-- ✅ Agent 信封格式（`发送者@群名`，含时间戳）
-- ✅ 群聊工具权限策略
-
-### 不支持（QQ 协议限制）
-
-- ❌ 消息编辑（无 streaming）
-- ❌ Reaction 表情回应
-- ❌ 内联按钮 / 投票
-- ❌ 消息线程
+| 能力 | 状态 |
+|------|------|
+| 私聊 / 群聊 | ✅ |
+| 引用回复 | ✅ |
+| 媒体（图片/语音/视频/文件） | ✅ |
+| 表情回应 | ✅ |
+| 撤回消息 | ✅ |
+| 消息编辑 | ❌（QQ 协议不支持） |
+| 投票 | ❌ |
+| 消息线程 | ❌ |
+| 消息特效 | ❌ |
 
 ## 前置条件
 
 1. 一台运行 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 的服务器，**正向 WebSocket** 已开启
-2. NapCat 消息格式设为 **Array**（非 String，String 格式也支持但推荐 Array）
+2. NapCat 消息格式设为 **Array**（推荐；String 格式也支持，自动兼容）
 3. OpenClaw Gateway 已安装并运行
 
 ## 安装
@@ -91,12 +134,16 @@ openclaw channels login napcatqq
 
 向导会依次询问：
 
-1. **WebSocket URL** — `wss://你的域名`（必填）
-2. **Access Token** — OneBot access_token（可留空）
-3. **DM 访问策略** — pairing（需审批）/ open（全放行）/ closed（全拒绝）
-4. **管理员 QQ 号** — 必填，用于审批通知
-5. **群聊策略** — disabled / pairing / open / allowlist
-6. **群聊 @机器人** — 是否需要 @才响应（仅群聊非 disabled 时询问）
+1. **账号 ID** — 多账号标识（默认 `default`）
+2. **WebSocket URL** — `wss://你的域名`（必填）
+3. **Access Token** — OneBot access_token（可留空）
+4. **DM 访问策略** — pairing（需审批）/ open（全放行）/ closed（全拒绝）
+5. **管理员 QQ 号** — 必填，用于审批通知
+6. **群聊策略** — disabled / pairing / open / allowlist
+7. **群聊 @机器人** — 是否需要 @才响应
+8. **自动同意好友请求** — 是否自动接受
+9. **自动同意入群邀请** — 是否自动接受
+10. **消息表情回应** — 收到消息是否打 ❤️
 
 ### 方式二：手动编辑 `openclaw.json`
 
@@ -113,6 +160,9 @@ openclaw channels login napcatqq
           "groupPolicy": "pairing",
           "groupAllowFrom": [],
           "allowFrom": ["你的QQ号"],
+          "autoAcceptFriend": false,
+          "autoAcceptGroupInvite": false,
+          "emojiAck": false,
           "dm": {
             "policy": "pairing",
             "allowFrom": []
@@ -144,6 +194,9 @@ openclaw gateway restart
 | `groupAllowFrom` | array | — | 群聊白名单（`g群号` 或纯群号或 QQ 号） |
 | `historyLimit` | number | `50` | 群聊历史消息缓存条数上限 |
 | `allowFrom` | array | — | 管理员/白名单 QQ 号列表 |
+| `autoAcceptFriend` | boolean | `false` | 自动同意好友请求（关闭时仅通知管理员） |
+| `autoAcceptGroupInvite` | boolean | `false` | 自动同意入群邀请（关闭时仅通知管理员） |
+| `emojiAck` | boolean | `false` | 收到消息时自动打 ❤️ 表情回应 |
 | `dm.policy` | string | `"pairing"` | 私聊策略：`pairing` / `open` / `closed` |
 | `dm.allowFrom` | array | — | 私聊白名单（与 `allowFrom` 合并使用，非互斥） |
 
@@ -213,15 +266,15 @@ openclaw pairing approve napcatqq <Code>
 |------|---------|
 | 文本 | 直接传递 |
 | 图片 | 下载转 base64 ImageContent（最多 5 张），文本标记 `[图片]` 或 `[图片: 描述]` |
-| 语音 | 下载到本地临时文件 → SDK `transcribeFirstAudio` 自动转写 → 转写完成后清理临时文件 |
-| QQ 表情 | `[QQ表情:ID]` |
-| 商城表情 | 表情摘要如 `[开心]` |
-| 视频 | `[视频消息]` |
+| 语音 | 下载到本地临时文件 → SDK 自动转写 → 清理临时文件 |
+| 视频 | 提取视频 URL 附加到文本 `[视频: URL]`，供 Agent 参考 |
 | 文件 | `[文件: 文件名]` 或 `[文件: 文件名 (大小)]` |
+| QQ 表情 | 自动映射为 Unicode Emoji（130+ 表情，未映射的显示 `[表情:ID]`） |
+| 商城表情 | 表情摘要如 `[开心]` |
 | 位置 | `[位置: 标题 内容 (经纬度)]` |
 | JSON 卡片 | 提取摘要 `[卡片: 描述]` |
 | 小程序 | `[小程序消息]` |
-| 合并转发 | `[合并转发消息]` |
+| 合并转发 | 展开前 5 条转发内容（含发送者名称） |
 | 引用回复 | 通过 `get_msg` API 获取被引用消息的内容和发送者 |
 | @提及 | 提取被 @ 的 QQ 号列表，用于 mention 检测 |
 
@@ -231,8 +284,15 @@ openclaw pairing approve napcatqq <Code>
 |------|------|
 | 纯文本 | ✅ |
 | 图片（URL / base64） | ✅ |
-| 文本+图片混合 | ✅ |
-| 引用回复 | ✅ (通过 `[[reply_to:xxx]]` 标签) |
+| 多图发送 | ✅（逐张发送） |
+| 语音 | ✅（独立发送，不与文本混合） |
+| 视频 | ✅（独立发送，不与文本混合） |
+| 文件 | ✅（`sendAttachment` action，base64 跨服务器传输） |
+| 引用回复 | ✅（`[[reply_to:xxx]]` 标签 或 `reply` action） |
+| 表情回应 | ✅（`react` action） |
+| 撤回消息 | ✅（`unsend` / `delete` action） |
+
+> **QQ 协议限制**：语音和视频消息段必须独立发送，不能和文本混在同一条消息中。插件自动处理：有文本+语音时，先发文本再发语音。
 
 ### 语音转写配置
 
@@ -343,7 +403,7 @@ location / {
 | `capabilities` | 能力声明（支持/不支持的特性） |
 | `configSchema` | JSON Schema + UI Hints（控制面板中文表单） |
 | `config` | 账号配置读写、allowFrom 解析、defaultTo |
-| `onboarding` | 向导式配置（`openclaw channels login`） |
+| `onboarding` | 向导式配置（`openclaw channels login`，10 步） |
 | `setup` | 快捷配置（`openclaw channels add`） |
 | `security` | DM 策略、安全警告检测 |
 | `pairing` | 配对认证（idLabel、审批通知） |
@@ -351,7 +411,7 @@ location / {
 | `directory` | 联系人/群列表（`get_friend_list` / `get_group_list`） |
 | `messaging` | 目标解析、格式化显示 |
 | `threading` | 线程/引用回复模式 |
-| `outbound` | 出站消息发送（文本/图片/chunker） |
+| `outbound` | 出站消息发送（文本/图片/语音/视频/文件/chunker） |
 | `status` | 连接状态、bot 信息、问题诊断 |
 | `gateway` | WS 长连接管理（start/stop/logout/probe） |
 
@@ -360,6 +420,7 @@ location / {
 ```
 openclaw-napcatqq/
 ├── README.md
+├── ROADMAP.md                  # 未实现功能路线图
 ├── package.json                # npm 包定义
 ├── tsconfig.json               # TypeScript 配置（仅类型检查）
 ├── index.ts                    # 入口 + PluginRuntime 初始化
@@ -367,15 +428,15 @@ openclaw-napcatqq/
     ├── types.ts                # OneBot v11 全量类型（23 种消息段 + 事件 + API）
     ├── runtime.ts              # PluginRuntime 全局引用
     ├── client-store.ts         # WebSocket 客户端连接池
-    ├── ws-client.ts            # WebSocket 客户端（自动重连 + 心跳 + echo 匹配）
-    ├── inbound.ts              # 入站消息解析（Array + CQ码双模式 + stripBotMention）
-    ├── outbound.ts             # 出站消息发送 + get_msg + get_login_info
+    ├── ws-client.ts            # WebSocket 客户端（自动重连 + 心跳 + echo 匹配 + 重连清理）
+    ├── inbound.ts              # 入站消息解析（Array + CQ码双模式 + QQ表情映射 + 转发展开）
+    ├── outbound.ts             # 出站消息发送 + 语音/视频独立发送 + 文件上传 + API 调用
     ├── config.ts               # 配置读取辅助 + ChannelConfigAdapter
     ├── config-schema.ts        # JSON Schema + UI Hints（控制面板中文表单）
-    ├── onboarding.ts           # 向导式配置 + Setup 适配器
-    ├── gateway.ts              # WS 长连接管理（事件路由 / 群过滤 / 审批命令 / 防抖器）
+    ├── onboarding.ts           # 向导式配置 + Setup 适配器（10 步）
+    ├── gateway.ts              # WS 长连接管理（事件路由 / 通知处理 / 请求处理 / 历史预加载）
     ├── handler.ts              # 入站消息处理（访问控制 / 音频下载 / 上下文构建 / 回复分发）
-    └── channel.ts              # 通道胶水层（meta / capabilities / security / outbound / status + 导出）
+    └── channel.ts              # 通道胶水层（meta / capabilities / 10 actions / outbound / status + 导出）
 ```
 
 ## 协议

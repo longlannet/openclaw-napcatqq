@@ -6,6 +6,34 @@
 import type { OneBotMessageEvent, OneBotSegment } from "./types.js";
 import { escapeRegExp } from "openclaw/plugin-sdk";
 
+/** QQ 表情 ID → Unicode Emoji 映射（常用部分） */
+export const QQ_FACE_EMOJI_MAP: Record<string, string> = {
+  "0": "😲", "1": "😖", "2": "😍", "3": "😶", "4": "😎",
+  "5": "😭", "6": "☺️", "7": "🤐", "8": "😴", "9": "😢",
+  "10": "😤", "11": "😊", "12": "😜", "13": "😁", "14": "🙂",
+  "15": "😡", "16": "🤗", "18": "😱", "19": "🤮", "20": "🤭",
+  "21": "😊", "22": "😌", "23": "😕", "24": "🤤", "25": "😂",
+  "26": "😅", "27": "😒", "28": "😘", "29": "😚", "30": "🔪",
+  "31": "🍺", "32": "😩", "33": "😓", "34": "😀", "35": "🥺",
+  "46": "🐷", "49": "🤡", "53": "🎂", "54": "⚡", "55": "💣",
+  "56": "🔪", "57": "⚽", "59": "💩", "60": "☕", "63": "🌹",
+  "64": "🥀", "66": "❤️", "67": "💔", "69": "🎁", "74": "🌞",
+  "75": "🌙", "76": "👍", "77": "👎", "78": "🤝", "79": "✌️",
+  "85": "😷", "86": "😣", "96": "😰", "97": "😥", "98": "😨",
+  "99": "😫", "100": "😤", "101": "😈", "102": "💀", "103": "🏁",
+  "104": "🏀", "105": "🏓", "106": "❤️", "107": "🐛", "108": "🐔",
+  "109": "🐶", "110": "👏", "111": "💪", "112": "🤞", "113": "🖕",
+  "114": "💃", "115": "🤦", "116": "🙇", "117": "🤷", "118": "💆",
+  "120": "✊", "121": "🤟", "122": "🤘", "123": "🤙", "124": "👌",
+  "125": "👈", "126": "👉", "127": "👆", "128": "👇", "129": "🙏",
+  "144": "🍉", "147": "🍭", "171": "🍵", "172": "😿", "173": "🐱",
+  "174": "🐻", "176": "🐲", "177": "🎉", "178": "🎊", "179": "🎈",
+  "182": "💊", "183": "🔫", "200": "🐑", "201": "🎄", "202": "🎎",
+  "203": "💝", "204": "🏠", "212": "😄", "214": "🤩",
+  "277": "🐕", "307": "🌈", "312": "🤳", "318": "💅", "319": "🤠",
+  "320": "😇", "322": "😴", "325": "🤮",
+};
+
 /** 把字节数字符串转为可读格式 */
 function formatFileSize(sizeStr: string): string {
   const bytes = Number(sizeStr);
@@ -125,9 +153,11 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
         }
 
         // ---- 表情类 ----
-        case "face":
-          textParts.push(`[QQ表情:${seg.data.id}]`);
+        case "face": {
+          const emoji = QQ_FACE_EMOJI_MAP[String(seg.data.id)];
+          textParts.push(emoji ?? `[QQ表情:${seg.data.id}]`);
           break;
+        }
 
         case "mface":
           // 商城表情有 summary 如 "[开心]"
@@ -188,9 +218,32 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
           break;
 
         // ---- 合并转发 ----
-        case "forward":
+        case "forward": {
           textParts.push("[合并转发消息]");
+          if (seg.data.content && Array.isArray(seg.data.content)) {
+            const forwardMessages = seg.data.content as Array<any>;
+            for (const fMsg of forwardMessages.slice(0, 5)) {
+              const sender = fMsg.sender?.nickname || fMsg.sender?.card || String(fMsg.user_id ?? "");
+              const msgSegs = Array.isArray(fMsg.message) ? fMsg.message : [];
+              const fParts: string[] = [];
+              for (const fSeg of msgSegs) {
+                if (fSeg.type === "text") fParts.push(fSeg.data?.text ?? "");
+                else if (fSeg.type === "image") fParts.push("[图片]");
+                else if (fSeg.type === "face") {
+                  const fEmoji = QQ_FACE_EMOJI_MAP[String(fSeg.data?.id)];
+                  fParts.push(fEmoji ?? "[表情]");
+                }
+                else if (fSeg.type) fParts.push(`[${fSeg.type}]`);
+              }
+              const fText = fParts.join("").trim();
+              if (fText) textParts.push(`  ${sender}: ${fText}`);
+            }
+            if (forwardMessages.length > 5) {
+              textParts.push(`  ...还有${forwardMessages.length - 5}条消息`);
+            }
+          }
           break;
+        }
 
         case "node":
           // 转发节点在 segment 解析层面忽略
@@ -254,9 +307,11 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
         case "reply":
           if (paramMap.id) replyToMessageId = paramMap.id;
           break;
-        case "face":
-          textParts.push(`[QQ表情:${paramMap.id || "?"}]`);
+        case "face": {
+          const faceEmoji = QQ_FACE_EMOJI_MAP[paramMap.id ?? ""];
+          textParts.push(faceEmoji ?? `[QQ表情:${paramMap.id || "?"}]`);
           break;
+        }
         default:
           textParts.push(`[${cqType}]`);
           break;
@@ -272,7 +327,7 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
     chatId,
     chatType: isGroup ? "group" : "direct",
     senderId: String(event.user_id),
-    senderName: event.sender.card || event.sender.nickname || String(event.user_id),
+    senderName: event.sender?.card || event.sender?.nickname || String(event.user_id),
     text: textParts.join("").trim(),
     messageId: String(event.message_id),
     replyToMessageId,

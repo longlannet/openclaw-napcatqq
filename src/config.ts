@@ -43,6 +43,10 @@ export function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): 
     groupAllowFrom: raw.groupAllowFrom as Array<string | number> | undefined,
     historyLimit: raw.historyLimit as number | undefined,
     dm: raw.dm as NapCatAccountConfig["dm"],
+    // v0.5 新增
+    autoAcceptFriend: raw.autoAcceptFriend as boolean | undefined,
+    autoAcceptGroupInvite: raw.autoAcceptGroupInvite as boolean | undefined,
+    emojiAck: raw.emojiAck as boolean | undefined,
   };
 }
 

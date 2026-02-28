@@ -16,6 +16,8 @@ import type {
   ChannelThreadingAdapter,
   ChannelStatusAdapter,
   ChannelStatusIssue,
+  ChannelMessageActionAdapter,
+  ChannelMessageActionContext,
   OpenClawConfig,
 } from "openclaw/plugin-sdk";
 import {
@@ -25,7 +27,7 @@ import {
   PAIRING_APPROVED_MESSAGE,
 } from "openclaw/plugin-sdk";
 import type { NapCatAccountConfig } from "./types.js";
-import { sendMessage, getLoginInfo } from "./outbound.js";
+import { sendMessage, getLoginInfo, deleteMessage, uploadPrivateFile, uploadGroupFile, markPrivateMsgAsRead, markGroupMsgAsRead, getGroupMemberInfo, setEssenceMsg, deleteEssenceMsg } from "./outbound.js";
 import { getClient, requireClient } from "./client-store.js";
 import { getNapCatRuntime } from "./runtime.js";
 import { CHANNEL_ID, listAccountIds, resolveAccount, getAccountsRecord, config } from "./config.js";
@@ -52,10 +54,10 @@ const capabilities: ChannelCapabilities = {
   chatTypes: ["direct", "group"],
   reply: true,
   media: true,
+  reactions: true,    // v0.5: set_msg_emoji_like
+  unsend: true,       // v0.5: delete_msg
   // QQ 协议不支持以下能力
-  reactions: false,
   edit: false,
-  unsend: false,
   polls: false,
   threads: false,
   effects: false,
@@ -237,14 +239,39 @@ const outbound: ChannelOutboundAdapter = {
     const isGroup = to.startsWith("g");
     const targetId = isGroup ? to.slice(1) : to;
 
+    // 检测媒体类型
+    const mediaUrl = ctx.mediaUrl ?? "";
+    const contentType = (ctx as any).mediaContentType ?? "";
+    const isAudio = contentType.startsWith("audio/") ||
+      /\.(mp3|ogg|wav|amr|silk|m4a|flac|aac)$/i.test(mediaUrl);
+    const isVideo = contentType.startsWith("video/") ||
+      /\.(mp4|avi|mkv|mov|webm)$/i.test(mediaUrl);
+
     const result = await sendMessage(client, {
       chatType: isGroup ? "group" : "direct",
       userId: isGroup ? undefined : targetId,
       groupId: isGroup ? targetId : undefined,
       text: ctx.text || undefined,
-      imageUrl: ctx.mediaUrl,
+      imageUrl: (!isAudio && !isVideo && mediaUrl) ? mediaUrl : undefined,
+      voiceUrl: isAudio ? mediaUrl : undefined,
+      videoUrl: isVideo ? mediaUrl : undefined,
       replyToMessageId: ctx.replyToId ?? undefined,
     });
+
+    // 发送额外的图片（mediaUrls 数组中的后续图片）
+    const extraUrls = ((ctx as any).mediaUrls ?? []).slice(1) as string[];
+    for (const extraUrl of extraUrls) {
+      try {
+        await sendMessage(client, {
+          chatType: isGroup ? "group" : "direct",
+          userId: isGroup ? undefined : targetId,
+          groupId: isGroup ? targetId : undefined,
+          imageUrl: extraUrl,
+        });
+      } catch {
+        log.warn(`[napcatqq] failed to send extra image: ${extraUrl}`);
+      }
+    }
 
     return {
       channel: CHANNEL_ID,
@@ -316,6 +343,243 @@ const status: ChannelStatusAdapter<NapCatAccountConfig> = {
   },
 };
 
+// ---------- 消息动作适配器（撤回、表情回应等） ----------
+
+const actions: ChannelMessageActionAdapter = {
+  supportsAction: ({ action }) => {
+    return ["unsend", "delete", "react", "send", "sendAttachment", "read", "reply", "member-info", "pin", "unpin"].includes(action);
+  },
+  listActions: () => ["unsend", "delete", "react", "send", "sendAttachment", "read", "reply", "member-info", "pin", "unpin"],
+  handleAction: async (ctx: ChannelMessageActionContext) => {
+    const accountId = ctx.accountId ?? DEFAULT_ACCOUNT_ID;
+    const client = getClient(accountId);
+    if (!client) {
+      return {
+        content: [{ type: "text" as const, text: "Not connected" }],
+        details: { ok: false },
+      };
+    }
+
+    const params = ctx.params;
+
+    // 撤回消息
+    if (ctx.action === "unsend" || ctx.action === "delete") {
+      const messageId = params.message_id ?? params.messageId;
+      if (!messageId) {
+        return {
+          content: [{ type: "text" as const, text: "message_id required" }],
+          details: { ok: false },
+        };
+      }
+      const ok = await deleteMessage(client, String(messageId));
+      return {
+        content: [{ type: "text" as const, text: ok ? `消息 ${messageId} 已撤回` : "撤回失败" }],
+        details: { ok },
+      };
+    }
+
+    // 表情回应
+    if (ctx.action === "react") {
+      const messageId = params.message_id ?? params.messageId;
+      const emoji = params.emoji ?? params.emoji_id ?? "76"; // 默认 👍 (ID=76)
+      if (!messageId) {
+        return {
+          content: [{ type: "text" as const, text: "message_id required" }],
+          details: { ok: false },
+        };
+      }
+      const { setMsgEmojiLike } = await import("./outbound.js");
+      const ok = await setMsgEmojiLike(client, String(messageId), String(emoji));
+      return {
+        content: [{ type: "text" as const, text: ok ? `已回应表情 ${emoji}` : "表情回应失败" }],
+        details: { ok },
+      };
+    }
+
+    // 发送文件
+    if (ctx.action === "sendAttachment") {
+      const target = String(params.target ?? params.to ?? "");
+      const buffer = params.buffer as string | undefined;
+      const filename = String(params.filename ?? params.name ?? "file");
+
+      if (!target) {
+        return {
+          content: [{ type: "text" as const, text: "target required" }],
+          details: { ok: false },
+        };
+      }
+      if (!buffer) {
+        return {
+          content: [{ type: "text" as const, text: "buffer (base64 file data) required" }],
+          details: { ok: false },
+        };
+      }
+
+      const to = target.replace(/^napcatqq:/i, "");
+      const isGroup = to.startsWith("g");
+      const targetId = isGroup ? to.slice(1) : to;
+
+      // 直接用 base64:// 前缀传给 NapCat，无需临时文件（支持跨服务器）
+      const fileData = `base64://${buffer}`;
+      let ok: boolean;
+      if (isGroup) {
+        ok = await uploadGroupFile(client, targetId, fileData, filename);
+      } else {
+        ok = await uploadPrivateFile(client, targetId, fileData, filename);
+      }
+
+      // 同时发送 caption（如果有的话）
+      const caption = String(params.caption ?? params.message ?? "");
+      if (ok && caption) {
+        await sendMessage(client, {
+          chatType: isGroup ? "group" : "direct",
+          userId: isGroup ? undefined : targetId,
+          groupId: isGroup ? targetId : undefined,
+          text: caption,
+        });
+      }
+
+      return {
+        content: [{ type: "text" as const, text: ok ? `文件 ${filename} 已发送` : "文件发送失败" }],
+        details: { ok, filename },
+      };
+    }
+
+    // 标记已读
+    if (ctx.action === "read") {
+      const target = String(params.target ?? params.to ?? "");
+      if (!target) {
+        return {
+          content: [{ type: "text" as const, text: "target required" }],
+          details: { ok: false },
+        };
+      }
+      const to = target.replace(/^napcatqq:/i, "");
+      const isGroup = to.startsWith("g");
+      const targetId = isGroup ? to.slice(1) : to;
+      const ok = isGroup
+        ? await markGroupMsgAsRead(client, targetId)
+        : await markPrivateMsgAsRead(client, targetId);
+      return {
+        content: [{ type: "text" as const, text: ok ? "已标记已读" : "标记已读失败" }],
+        details: { ok },
+      };
+    }
+
+    // 发送消息（send action — Agent 主动发消息到指定目标）
+    if (ctx.action === "send") {
+      const target = String(params.target ?? params.to ?? "");
+      const text = String(params.message ?? params.text ?? "");
+      if (!target || !text) {
+        return {
+          content: [{ type: "text" as const, text: "target and message required" }],
+          details: { ok: false },
+        };
+      }
+      const to = target.replace(/^napcatqq:/i, "");
+      const isGroup = to.startsWith("g");
+      const targetId = isGroup ? to.slice(1) : to;
+      const result = await sendMessage(client, {
+        chatType: isGroup ? "group" : "direct",
+        userId: isGroup ? undefined : targetId,
+        groupId: isGroup ? targetId : undefined,
+        text,
+      });
+      return {
+        content: [{ type: "text" as const, text: result.ok ? "已发送" : `发送失败: ${result.error}` }],
+        details: { ok: result.ok, messageId: result.messageId },
+      };
+    }
+
+    // 引用回复
+    if (ctx.action === "reply") {
+      const target = String(params.target ?? params.to ?? "");
+      const replyToId = String(params.replyTo ?? params.message_id ?? params.messageId ?? "");
+      const text = String(params.message ?? params.text ?? "");
+      if (!target || !text) {
+        return {
+          content: [{ type: "text" as const, text: "target and message required" }],
+          details: { ok: false },
+        };
+      }
+      const to = target.replace(/^napcatqq:/i, "");
+      const isGroup = to.startsWith("g");
+      const targetId = isGroup ? to.slice(1) : to;
+      const result = await sendMessage(client, {
+        chatType: isGroup ? "group" : "direct",
+        userId: isGroup ? undefined : targetId,
+        groupId: isGroup ? targetId : undefined,
+        text,
+        replyToMessageId: replyToId || undefined,
+      });
+      return {
+        content: [{ type: "text" as const, text: result.ok ? "已回复" : `回复失败: ${result.error}` }],
+        details: { ok: result.ok, messageId: result.messageId },
+      };
+    }
+
+    // 获取群成员信息
+    if (ctx.action === "member-info") {
+      const groupId = String(params.groupId ?? params.group_id ?? "");
+      const userId = String(params.userId ?? params.user_id ?? params.target ?? "");
+      if (!groupId || !userId) {
+        return {
+          content: [{ type: "text" as const, text: "groupId and userId required" }],
+          details: { ok: false },
+        };
+      }
+      const info = await getGroupMemberInfo(client, groupId, userId);
+      if (!info) {
+        return {
+          content: [{ type: "text" as const, text: "获取群成员信息失败" }],
+          details: { ok: false },
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `${info.card || info.nickname} (${info.user_id})\n角色: ${info.role}\n头衔: ${info.title || "无"}\n等级: ${info.level}` }],
+        details: { ok: true, ...info },
+      };
+    }
+
+    // 精华消息（pin → set_essence_msg）
+    if (ctx.action === "pin") {
+      const messageId = params.message_id ?? params.messageId;
+      if (!messageId) {
+        return {
+          content: [{ type: "text" as const, text: "message_id required" }],
+          details: { ok: false },
+        };
+      }
+      const ok = await setEssenceMsg(client, String(messageId));
+      return {
+        content: [{ type: "text" as const, text: ok ? `消息 ${messageId} 已设为精华` : "设置精华失败" }],
+        details: { ok },
+      };
+    }
+
+    // 取消精华（unpin → delete_essence_msg）
+    if (ctx.action === "unpin") {
+      const messageId = params.message_id ?? params.messageId;
+      if (!messageId) {
+        return {
+          content: [{ type: "text" as const, text: "message_id required" }],
+          details: { ok: false },
+        };
+      }
+      const ok = await deleteEssenceMsg(client, String(messageId));
+      return {
+        content: [{ type: "text" as const, text: ok ? `消息 ${messageId} 已取消精华` : "取消精华失败" }],
+        details: { ok },
+      };
+    }
+
+    return {
+      content: [{ type: "text" as const, text: `Unsupported action: ${ctx.action}` }],
+      details: { ok: false },
+    };
+  },
+};
+
 // ---------- 导出通道插件 ----------
 
 export const napcatChannel: ChannelPlugin<NapCatAccountConfig> = {
@@ -340,6 +604,7 @@ export const napcatChannel: ChannelPlugin<NapCatAccountConfig> = {
   messaging,
   threading,
   outbound,
+  actions,
   status,
   gateway,
 };
