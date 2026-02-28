@@ -198,6 +198,44 @@ export async function sendMessage(client: NapCatWsClient, opts: SendOptions): Pr
 /**
  * 通过 get_msg API 获取消息内容（用于引用回复上下文）
  */
+export async function getFileUrl(
+  client: NapCatWsClient,
+  fileId: string,
+  chatType: "direct" | "group",
+  groupId?: string,
+): Promise<{ url?: string; base64?: string; path?: string } | null> {
+  try {
+    if (chatType === "group" && groupId) {
+      const resp = await client.callApi("get_group_file_url", { file_id: fileId, group_id: Number(groupId) }, 15000);
+      if (resp.status === "ok" && resp.data) {
+        return { url: (resp.data as any).url };
+      }
+    } else {
+      const resp = await client.callApi("get_private_file_url", { file_id: fileId }, 15000);
+      if (resp.status === "ok" && resp.data) {
+        return { url: (resp.data as any).url };
+      }
+    }
+    
+    // 兜底方案：如果获取直链失败，再用原版的 get_file
+    const fallbackResp = await client.callApi("get_file", { file_id: fileId }, 15000);
+    if (fallbackResp.status === "ok" && fallbackResp.data) {
+      const data = fallbackResp.data as { url?: string; base64?: string; file?: string };
+      return {
+        url: data.url,
+        base64: data.base64,
+        path: data.file, // local path on NapCat server
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 通过 get_msg API 获取消息内容（用于引用回复上下文）
+ */
 export async function getMessage(
   client: NapCatWsClient,
   messageId: string,
@@ -285,8 +323,12 @@ export async function deleteMessage(
 ): Promise<boolean> {
   try {
     const resp = await client.callApi("delete_msg", { message_id: Number(messageId) }, 5000);
+    if (resp.status !== "ok") {
+      console.warn(`[napcatqq] delete_msg failed for ${messageId}:`, resp);
+    }
     return resp.status === "ok";
-  } catch {
+  } catch (err) {
+    console.error(`[napcatqq] delete_msg error for ${messageId}:`, err);
     return false;
   }
 }

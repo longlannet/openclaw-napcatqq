@@ -10,6 +10,7 @@ export interface FileBaseData {
   url?: string;      // 文件 URL
   name?: string;     // 文件名
   thumb?: string;    // 缩略图
+  file_id?: string;  // 文件ID（NapCatQQ 私有扩展）
 }
 
 // ---------- 消息段类型 ----------

@@ -55,7 +55,7 @@ export interface NormalizedInbound {
   imageUrls: string[];       // 图片 URL 列表
   audioUrls: string[];       // 语音 URL 列表
   videoUrls: string[];       // 视频 URL 列表
-  fileInfos: Array<{ name: string; url?: string; size?: string }>; // 文件信息
+  fileInfos: Array<{ name: string; url?: string; fileId?: string; size?: string }>; // 文件信息
   mentions: string[];        // 被 @ 的 QQ 号列表
   mentionsAll: boolean;      // 是否 @全体
   groupId?: string;          // 群号（群聊时）
@@ -83,7 +83,7 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
   const imageUrls: string[] = [];
   const audioUrls: string[] = [];
   const videoUrls: string[] = [];
-  const fileInfos: Array<{ name: string; url?: string; size?: string }> = [];
+  const fileInfos: Array<{ name: string; url?: string; fileId?: string; size?: string }> = [];
   const mentions: string[] = [];
   let mentionsAll = false;
   let replyToMessageId: string | undefined;
@@ -138,7 +138,8 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
 
         case "file": {
           const name = seg.data.name || seg.data.file || "未知文件";
-          fileInfos.push({ name, url: seg.data.url });
+          const fileId = seg.data.file_id || undefined;
+          fileInfos.push({ name, url: seg.data.url, fileId });
           textParts.push(`[文件: ${name}]`);
           break;
         }
@@ -299,8 +300,9 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
           break;
         case "file": {
           const fname = paramMap.name || paramMap.file || "未知文件";
-          if (paramMap.url) fileInfos.push({ name: fname, url: paramMap.url });
-          else fileInfos.push({ name: fname });
+          const fileId = paramMap.file_id || undefined;
+          if (paramMap.url) fileInfos.push({ name: fname, url: paramMap.url, fileId });
+          else fileInfos.push({ name: fname, fileId });
           textParts.push(`[文件: ${fname}]`);
           break;
         }

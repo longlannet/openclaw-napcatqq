@@ -20,7 +20,7 @@ import {
 } from "openclaw/plugin-sdk";
 import type { NormalizedInbound } from "./inbound.js";
 import { isMentioningBot } from "./inbound.js";
-import { sendMessage, getMessage, setMsgEmojiLike, markPrivateMsgAsRead, markGroupMsgAsRead } from "./outbound.js";
+import { sendMessage, getMessage, getFileUrl, setMsgEmojiLike, markPrivateMsgAsRead, markGroupMsgAsRead } from "./outbound.js";
 import { getClient } from "./client-store.js";
 import { getNapCatRuntime } from "./runtime.js";
 import { CHANNEL_ID, resolveAccount } from "./config.js";
@@ -240,6 +240,45 @@ export async function handleInboundMessage(
         videoIdx++;
         return url ? `[视频${videoIdx}: ${url}]` : `[视频${videoIdx}]`;
       });
+    }
+  }
+
+  // 5c. 文件处理（尝试获取下载链接或直接提取 base64 下载到本地临时目录）
+  if (inbound.fileInfos && inbound.fileInfos.length > 0) {
+    const client = getClient(accountId);
+    for (const file of inbound.fileInfos) {
+      let finalUrl = file.url;
+      if (!finalUrl && file.fileId && client) {
+        // 通过 API 请求文件数据
+        const fileData = await getFileUrl(client, file.fileId, inbound.chatType, inbound.groupId);
+        if (fileData) {
+          if (fileData.url) {
+            finalUrl = fileData.url;
+          } else if (fileData.base64) {
+            // 如果 NapCat 返回了 base64 数据，直接在 OpenClaw 所在服务器落地为文件
+            try {
+              const fileTmpDir = resolvePreferredOpenClawTmpDir();
+              const safeName = file.name.replace(/[^a-zA-Z0-9_.-]/g, '_');
+              const localPath = join(fileTmpDir, `${Date.now()}_${safeName}`);
+              writeFileSync(localPath, Buffer.from(fileData.base64, "base64"));
+              finalUrl = `file://${localPath}`;
+              log?.info(`[napcatqq] Wrote base64 file to local path: ${localPath}`);
+            } catch (e) {
+              log?.error(`[napcatqq] Failed to write base64 file: ${String(e)}`);
+            }
+          } else if (fileData.path) {
+            // 兜底：如果都没有，就把 NapCat 那边的绝对路径塞进去（虽然通常不在同一台机器，但聊胜于无）
+            finalUrl = fileData.path;
+          }
+        }
+      }
+      if (finalUrl) {
+        const searchRegex = new RegExp(`\\[文件:\\s*${file.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s*\\([^)]+\\))?\\]`, 'g');
+        inbound.text = inbound.text.replace(searchRegex, `[文件: ${file.name} (URL: ${finalUrl})]`);
+        log?.info(`[napcatqq] Resolved file URL for ${file.name}: ${finalUrl}`);
+      } else {
+        log?.warn(`[napcatqq] File info missing URL: ${JSON.stringify(file)}`);
+      }
     }
   }
 
@@ -491,6 +530,14 @@ export async function handleInboundMessage(
           }
           if (mediaDedupKey && mediaUrl) sentMediaInThisTurn.add(mediaDedupKey);
           log?.info(`[napcatqq] deliver: sent type=${isAudio ? "record" : (isVideo ? "video" : (mediaUrl ? "image" : "text"))} ok=${result.ok} msgId=${result.messageId}`);
+          
+          // 【增强 Agent 记忆】：将发送成功的消息 ID 通过系统事件告知 Agent，以便实现“撤回”等 Action
+          if (result.messageId) {
+            core.system.enqueueSystemEvent(`[系统提示] 你刚刚发送了一条消息，请记住该消息的 messageId: ${result.messageId} (若需撤回或回应，请使用此 ID)`, {
+              sessionKey: route.sessionKey,
+              contextKey: `napcatqq:outbound:${result.messageId}`,
+            });
+          }
         }
       },
       onError: (err, info) => {
