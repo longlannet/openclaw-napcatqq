@@ -370,7 +370,12 @@ openclaw-napcatqq/
     ├── ws-client.ts            # WebSocket 客户端（自动重连 + 心跳 + echo 匹配）
     ├── inbound.ts              # 入站消息解析（Array + CQ码双模式 + stripBotMention）
     ├── outbound.ts             # 出站消息发送 + get_msg + get_login_info
-    └── channel.ts              # 通道适配器（14 个 adapter + 群聊 pairing + QQ 快捷命令）
+    ├── config.ts               # 配置读取辅助 + ChannelConfigAdapter
+    ├── config-schema.ts        # JSON Schema + UI Hints（控制面板中文表单）
+    ├── onboarding.ts           # 向导式配置 + Setup 适配器
+    ├── gateway.ts              # WS 长连接管理（事件路由 / 群过滤 / 审批命令 / 防抖器）
+    ├── handler.ts              # 入站消息处理（访问控制 / 音频下载 / 上下文构建 / 回复分发）
+    └── channel.ts              # 通道胶水层（meta / capabilities / security / outbound / status + 导出）
 ```
 
 ## 协议
