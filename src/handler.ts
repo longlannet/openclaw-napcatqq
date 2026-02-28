@@ -24,7 +24,7 @@ import { sendMessage, getMessage, setMsgEmojiLike, markPrivateMsgAsRead, markGro
 import { getClient } from "./client-store.js";
 import { getNapCatRuntime } from "./runtime.js";
 import { CHANNEL_ID, resolveAccount } from "./config.js";
-import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
@@ -208,8 +208,12 @@ export async function handleInboundMessage(
       try {
         const controller = new AbortController();
         const fetchTimeout = setTimeout(() => controller.abort(), 30_000);
-        const resp = await fetch(audioUrl, { signal: controller.signal });
-        clearTimeout(fetchTimeout);
+        let resp;
+        try {
+          resp = await fetch(audioUrl, { signal: controller.signal });
+        } finally {
+          clearTimeout(fetchTimeout);
+        }
         if (!resp.ok) continue;
         const buf = Buffer.from(await resp.arrayBuffer());
         const ext = (resp.headers.get("content-type") ?? "").includes("silk") ? ".silk" : ".amr";
@@ -413,12 +417,47 @@ export async function handleInboundMessage(
     accountId: route.accountId,
   });
 
+  // 同一轮回复内媒体去重：避免 tool 阶段发了语音，final 阶段又把同一 mp3 当文件再发一遍
+  const sentMediaInThisTurn = new Set<string>();
+
   const { dispatcher, replyOptions, markDispatchIdle } =
     core.channel.reply.createReplyDispatcherWithTyping({
       ...prefixOptions,
       typingCallbacks,
       deliver: async (payload, info) => {
-        log?.info(`[napcatqq] deliver: text=${!!payload.text} media=${!!payload.mediaUrl} kind=${info?.kind}`);
+        const payloadAny = payload as any;
+        const mediaUrls = Array.isArray(payloadAny.mediaUrls) ? payloadAny.mediaUrls.filter(Boolean).map(String) : [];
+        let text = payload.text ?? "";
+        let mediaUrl = payload.mediaUrl ?? mediaUrls[0] ?? "";
+
+        // 兼容工具输出里的 MEDIA token（例如 MEDIA:/tmp/...）
+        if (!mediaUrl && text.includes("MEDIA:")) {
+          const mediaMatch = text.match(/\bMEDIA:\s*`?([^`\n]+)`?/i);
+          if (mediaMatch?.[1]) {
+            mediaUrl = mediaMatch[1].trim();
+            text = text.replace(mediaMatch[0], "").trim();
+          }
+        }
+
+        // 兜底：某些链路会把 /tmp/openclaw/tts-... 路径直接写进文本（没有 MEDIA: 前缀）
+        if (!mediaUrl) {
+          const rawPathMatch = text.match(/(\/tmp\/openclaw\/tts-[^\s`"']+\/voice-[^\s`"']+\.(mp3|ogg|wav|m4a|amr|silk|flac|aac))/i);
+          if (rawPathMatch?.[1]) {
+            mediaUrl = rawPathMatch[1].trim();
+            text = text.replace(rawPathMatch[1], "").trim();
+          }
+        }
+
+        // 去重：同一轮内若已发送过同一媒体，不重复发送
+        const mediaDedupKey = mediaUrl ? mediaUrl.replace(/^MEDIA:\s*/i, "").trim() : "";
+        if (mediaDedupKey && sentMediaInThisTurn.has(mediaDedupKey)) {
+          log?.info(`[napcatqq] deliver: skip duplicate media in same turn: ${mediaDedupKey}`);
+          // 若重复媒体还带文本，仅发送文本
+          mediaUrl = "";
+        }
+
+        log?.info(`[napcatqq] deliver: kind=${info?.kind} text=${!!text} media=${!!mediaUrl} mediaCount=${mediaUrls.length} keys=${Object.keys(payload).join(",")}`);
+
         const replyClient = getClient(accountId);
         if (!replyClient) {
           log?.error(`[napcatqq] deliver: no client for account ${accountId}`);
@@ -429,11 +468,11 @@ export async function handleInboundMessage(
         const isGroupReply = replyTo.startsWith("g");
         const replyTargetId = isGroupReply ? replyTo.slice(1) : replyTo;
 
-        if (payload.text || payload.mediaUrl) {
+        if (text || mediaUrl) {
           // 检测媒体类型
-          const mediaUrl = payload.mediaUrl ?? "";
-          const mimeType = (payload as any).mediaContentType ?? "";
-          const isAudio = mimeType.startsWith("audio/") ||
+          const mimeType = String(payloadAny.mediaContentType ?? "");
+          const audioAsVoice = payloadAny.audioAsVoice === true;
+          const isAudio = audioAsVoice || mimeType.startsWith("audio/") ||
             /\.(mp3|ogg|wav|amr|silk|m4a|flac|aac)$/i.test(mediaUrl);
           const isVideo = mimeType.startsWith("video/") ||
             /\.(mp4|avi|mkv|mov|webm)$/i.test(mediaUrl);
@@ -442,7 +481,7 @@ export async function handleInboundMessage(
             chatType: isGroupReply ? "group" : "direct",
             userId: isGroupReply ? undefined : replyTargetId,
             groupId: isGroupReply ? replyTargetId : undefined,
-            text: payload.text || undefined,
+            text: text || undefined,
             imageUrl: (!isAudio && !isVideo) ? mediaUrl || undefined : undefined,
             voiceUrl: isAudio ? mediaUrl : undefined,
             videoUrl: isVideo ? mediaUrl : undefined,
@@ -450,7 +489,8 @@ export async function handleInboundMessage(
           if (!result.ok) {
             throw new Error(`sendMessage failed: ${result.error}`);
           }
-          log?.info(`[napcatqq] deliver: ok=${result.ok} msgId=${result.messageId}`);
+          if (mediaDedupKey && mediaUrl) sentMediaInThisTurn.add(mediaDedupKey);
+          log?.info(`[napcatqq] deliver: sent type=${isAudio ? "record" : (isVideo ? "video" : (mediaUrl ? "image" : "text"))} ok=${result.ok} msgId=${result.messageId}`);
         }
       },
       onError: (err, info) => {
@@ -465,16 +505,19 @@ export async function handleInboundMessage(
       try {
         const controller = new AbortController();
         const fetchTimeout = setTimeout(() => controller.abort(), 30_000);
-        const resp = await fetch(imgUrl, { signal: controller.signal });
-        clearTimeout(fetchTimeout);
-        if (resp.ok) {
-          const buf = Buffer.from(await resp.arrayBuffer());
-          const contentType = resp.headers.get("content-type") || "image/png";
-          inboundImages.push({
-            type: "image",
-            data: buf.toString("base64"),
-            mimeType: contentType.split(";")[0].trim(),
-          });
+        try {
+          const resp = await fetch(imgUrl, { signal: controller.signal });
+          if (resp.ok) {
+            const buf = Buffer.from(await resp.arrayBuffer());
+            const contentType = resp.headers.get("content-type") || "image/png";
+            inboundImages.push({
+              type: "image",
+              data: buf.toString("base64"),
+              mimeType: contentType.split(";")[0].trim(),
+            });
+          }
+        } finally {
+          clearTimeout(fetchTimeout);
         }
       } catch (err) {
         log?.warn(`[napcatqq] Failed to download inbound image: ${String(err)}`);

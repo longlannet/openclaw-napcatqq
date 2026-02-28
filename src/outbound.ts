@@ -2,9 +2,60 @@
 // 出站消息处理 — OpenClaw 回复 → NapCat API 调用
 // ============================================================
 
+import { readFileSync, existsSync, mkdtempSync, unlinkSync, rmdirSync } from "node:fs";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import type { NapCatWsClient } from "./ws-client.js";
 import type { OneBotSegment } from "./types.js";
 import { QQ_FACE_EMOJI_MAP } from "./inbound.js";
+
+/**
+ * 如果是本地文件路径，读取并转成 base64:// 前缀（跨服务器兼容）。
+ * 如果是 URL 或已经是 base64://，原样返回。
+ */
+type ResolvedMedia = { file: string; name?: string; missingLocal?: boolean };
+
+function resolveFileToBase64(filePath: string, kind?: "audio" | "video" | "image"): ResolvedMedia {
+  // 兼容 MEDIA: 前缀
+  const normalized = filePath.replace(/^MEDIA:\s*/i, "").replace(/^`|`$/g, "").trim();
+
+  // 已经是 URL 或 base64
+  if (/^https?:\/\//i.test(normalized) || normalized.startsWith("base64://")) {
+    return { file: normalized };
+  }
+
+  // 对于本地绝对路径：必须存在才允许继续，否则不要回退原样（NapCat 无法访问 OpenClaw 本地路径）
+  const looksLocalPath = normalized.startsWith("/") || normalized.startsWith("./") || normalized.startsWith("../") || /^[a-zA-Z]:[\\/]/.test(normalized);
+
+  // 本地文件路径 → 读取转 base64（跨服务器部署必须）
+  if (existsSync(normalized)) {
+    let buf: Buffer;
+    try {
+      buf = readFileSync(normalized);
+    } catch {
+      return { file: normalized, missingLocal: true };
+    }
+
+    if (!buf || buf.length === 0) {
+      return { file: normalized, missingLocal: true };
+    }
+    const name = basename(normalized) || undefined;
+
+    return {
+      file: `base64://${buf.toString("base64")}`,
+      name,
+    };
+  }
+
+  // 本地路径但文件不存在：不要把本机路径透传给 NapCat（它无法访问）
+  if (looksLocalPath) {
+    return { file: normalized, missingLocal: true };
+  }
+
+  // 其他情况（可能是可访问的 URI），原样返回让 NapCat 尝试
+  return { file: normalized };
+}
 
 export interface SendOptions {
   chatType: "direct" | "group";
@@ -47,9 +98,16 @@ export async function sendMessage(client: NapCatWsClient, opts: SendOptions): Pr
 
   // 图片
   if (opts.imageUrl) {
+    const resolved = resolveFileToBase64(opts.imageUrl, "image");
+    if (resolved.missingLocal) {
+      return { ok: false, error: `Local media file missing/unreadable: ${opts.imageUrl}` };
+    }
     segments.push({
       type: "image",
-      data: { file: opts.imageUrl },
+      data: {
+        file: resolved.file,
+        ...(resolved.name ? { name: resolved.name } : {}),
+      },
     });
   }
 
@@ -64,9 +122,16 @@ export async function sendMessage(client: NapCatWsClient, opts: SendOptions): Pr
       try { await client.callApi(textAction, textParams); } catch { /* ignore text send error */ }
       segments.length = 0; // 清空已发的文本段
     }
+    const resolved = resolveFileToBase64(opts.voiceUrl, "audio");
+    if (resolved.missingLocal) {
+      return { ok: false, error: `Local voice file missing/unreadable: ${opts.voiceUrl}` };
+    }
     segments.push({
       type: "record",
-      data: { file: opts.voiceUrl },
+      data: {
+        file: resolved.file,
+        ...(resolved.name ? { name: resolved.name } : {}),
+      },
     });
   }
 
@@ -80,9 +145,16 @@ export async function sendMessage(client: NapCatWsClient, opts: SendOptions): Pr
       try { await client.callApi(textAction, textParams); } catch { /* ignore */ }
       segments.length = 0;
     }
+    const resolved = resolveFileToBase64(opts.videoUrl, "video");
+    if (resolved.missingLocal) {
+      return { ok: false, error: `Local video file missing/unreadable: ${opts.videoUrl}` };
+    }
     segments.push({
       type: "video",
-      data: { file: opts.videoUrl },
+      data: {
+        file: resolved.file,
+        ...(resolved.name ? { name: resolved.name } : {}),
+      },
     });
   }
 
