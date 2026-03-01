@@ -32,8 +32,6 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 | `read` | 标记消息已读 |
 | `sendAttachment` | 发送文件（私聊/群聊） |
 | `member-info` | 查询群成员信息（角色/头衔/等级） |
-| `pin` | 设为精华消息 |
-| `unpin` | 取消精华消息 |
 
 ### 访问控制
 

@@ -55,7 +55,7 @@ const capabilities: ChannelCapabilities = {
   reply: true,
   media: true,
   reactions: true,    // v0.5: set_msg_emoji_like
-  unsend: true,       // v0.5: delete_msg
+  unsend: false,      // v0.6: disabled, Agent context doesn't track outgoing msgIds well, better suited for group admin bots
   // QQ 协议不支持以下能力
   edit: false,
   polls: false,
@@ -347,9 +347,9 @@ const status: ChannelStatusAdapter<NapCatAccountConfig> = {
 
 const actions: ChannelMessageActionAdapter = {
   supportsAction: ({ action }) => {
-    return ["unsend", "delete", "react", "send", "sendAttachment", "read", "reply", "member-info", "pin", "unpin"].includes(action);
+    return ["react", "send", "sendAttachment", "read", "reply", "member-info"].includes(action);
   },
-  listActions: () => ["unsend", "delete", "react", "send", "sendAttachment", "read", "reply", "member-info", "pin", "unpin"],
+  listActions: () => ["react", "send", "sendAttachment", "read", "reply", "member-info"],
   handleAction: async (ctx: ChannelMessageActionContext) => {
     const accountId = ctx.accountId ?? DEFAULT_ACCOUNT_ID;
     const client = getClient(accountId);
@@ -361,22 +361,6 @@ const actions: ChannelMessageActionAdapter = {
     }
 
     const params = ctx.params;
-
-    // 撤回消息
-    if (ctx.action === "unsend" || ctx.action === "delete") {
-      const messageId = params.message_id ?? params.messageId;
-      if (!messageId) {
-        return {
-          content: [{ type: "text" as const, text: "message_id required" }],
-          details: { ok: false },
-        };
-      }
-      const ok = await deleteMessage(client, String(messageId));
-      return {
-        content: [{ type: "text" as const, text: ok ? `消息 ${messageId} 已撤回` : "撤回失败" }],
-        details: { ok },
-      };
-    }
 
     // 表情回应
     if (ctx.action === "react") {
@@ -538,38 +522,6 @@ const actions: ChannelMessageActionAdapter = {
       return {
         content: [{ type: "text" as const, text: `${info.card || info.nickname} (${info.user_id})\n角色: ${info.role}\n头衔: ${info.title || "无"}\n等级: ${info.level}` }],
         details: { ok: true, ...info },
-      };
-    }
-
-    // 精华消息（pin → set_essence_msg）
-    if (ctx.action === "pin") {
-      const messageId = params.message_id ?? params.messageId;
-      if (!messageId) {
-        return {
-          content: [{ type: "text" as const, text: "message_id required" }],
-          details: { ok: false },
-        };
-      }
-      const ok = await setEssenceMsg(client, String(messageId));
-      return {
-        content: [{ type: "text" as const, text: ok ? `消息 ${messageId} 已设为精华` : "设置精华失败" }],
-        details: { ok },
-      };
-    }
-
-    // 取消精华（unpin → delete_essence_msg）
-    if (ctx.action === "unpin") {
-      const messageId = params.message_id ?? params.messageId;
-      if (!messageId) {
-        return {
-          content: [{ type: "text" as const, text: "message_id required" }],
-          details: { ok: false },
-        };
-      }
-      const ok = await deleteEssenceMsg(client, String(messageId));
-      return {
-        content: [{ type: "text" as const, text: ok ? `消息 ${messageId} 已取消精华` : "取消精华失败" }],
-        details: { ok },
       };
     }
 
