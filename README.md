@@ -29,8 +29,6 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 | `send` | 主动发消息（指定目标 QQ 号或 `g群号`） |
 | `reply` | 引用回复指定消息 |
 | `react` | 消息表情回应（`set_msg_emoji_like`，默认 👍） |
-| `unsend` | 撤回消息 |
-| `delete` | 删除消息（同 unsend） |
 | `read` | 标记消息已读 |
 | `sendAttachment` | 发送文件（私聊/群聊） |
 | `member-info` | 查询群成员信息（角色/头衔/等级） |
@@ -290,7 +288,7 @@ openclaw pairing approve napcatqq <Code>
 | 文件 | ✅（`sendAttachment` action，base64 跨服务器传输） |
 | 引用回复 | ✅（`[[reply_to:xxx]]` 标签 或 `reply` action） |
 | 表情回应 | ✅（`react` action） |
-| 撤回消息 | ✅（`unsend` / `delete` action） |
+| 撤回消息 | ❌（已降级为群管指令预留，大模型日常对话不建议使用） |
 
 > **QQ 协议限制**：语音和视频消息段必须独立发送，不能和文本混在同一条消息中。插件自动处理：有文本+语音时，先发文本再发语音。
 

@@ -7,12 +7,14 @@
 
 ## 一、Actions（Agent 主动操作能力）
 
-当前已实现 10 个: `unsend, delete, react, send, sendAttachment, read, reply, member-info, pin, unpin`
+当前已实现 8 个: `react, send, sendAttachment, read, reply, member-info, pin, unpin`
 
-### 群管理类
+### 群管理类 (及高级权限 Action)
 
 | Action | NapCat API | 说明 | 难度 |
 |--------|-----------|------|------|
+| `unsend` | `delete_msg` | 撤回消息。需传入 message_id。注意 Agent 自身很难获取已发出的 msgId，所以该功能更适合配合指令或被引用消息使用 | 已降级 |
+| `delete` | `delete_msg` | 同上（撤回 / 删除他人消息）。通常需要管理员权限 | 低 |
 | `kick` | `set_group_kick` | 踢出群成员。参数: `group_id`, `user_id`, `reject_add_request`(是否拒绝再次加群) | 低 |
 | `ban` | `set_group_ban` | 禁言指定成员。参数: `group_id`, `user_id`, `duration`(秒，0=解禁) | 低 |
 | `ban-all` | `set_group_whole_ban` | 全体禁言/解禁。参数: `group_id`, `enable` | 低 |
@@ -183,6 +185,7 @@ NapCat 在 OneBot v11 基础上扩展了大量 API，部分可能有用：
 ## 八、版本路线建议
 
 ### v0.7 — 群管理基础
+- [ ] `unsend`/`delete` action (仅作为群管理指令，不在普通聊天中过度声明)
 - [ ] `kick` action
 - [ ] `ban` / `ban-all` action
 - [ ] `leaveGroup` action
