@@ -72,7 +72,13 @@ export class NapCatWsClient {
       }, timeoutMs);
       this.pendingCalls.set(echo, { resolve, reject, timer });
       const req: OneBotApiRequest = { action, params, echo };
-      this.ws.send(JSON.stringify(req));
+      try {
+        this.ws.send(JSON.stringify(req));
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingCalls.delete(echo);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
@@ -108,12 +114,14 @@ export class NapCatWsClient {
     this.ws = ws;
 
     ws.on("open", () => {
+      if (this.ws !== ws) return;
       this.opts.logger.info("[napcatqq] WebSocket connected");
       this.resetHeartbeatTimer();
       this.opts.onConnected?.();
     });
 
     ws.on("message", (raw: Buffer | string) => {
+      if (this.ws !== ws) return;
       this.resetHeartbeatTimer();
       let data: any;
       try {
@@ -141,12 +149,14 @@ export class NapCatWsClient {
     });
 
     ws.on("close", (code, reason) => {
+      if (this.ws !== ws) return;
       this.opts.logger.warn(`[napcatqq] WebSocket closed: ${code} ${reason?.toString() ?? ""}`);
       this.opts.onDisconnected?.();
       this.scheduleReconnect();
     });
 
     ws.on("error", (err) => {
+      if (this.ws !== ws) return;
       this.opts.logger.error("[napcatqq] WebSocket error:", err.message);
       // 不手动调用 ws.close()，error 事件后 Node.js ws 库会自动触发 close 事件
       // 手动 close 会导致 close 回调触发两次 → 双重重连

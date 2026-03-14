@@ -69,11 +69,13 @@ export const onboarding: ChannelOnboardingAdapter = {
     nextCfg.channels ??= {};
     nextCfg.channels.napcatqq ??= {};
     nextCfg.channels.napcatqq.accounts ??= {};
+    const existingAccount = nextCfg.channels.napcatqq.accounts[accountId] ?? {};
     nextCfg.channels.napcatqq.accounts[accountId] = {
+      ...existingAccount,
       enabled: true,
       wsUrl,
       ...(accessToken ? { accessToken } : {}),
-      dm: {},
+      dm: typeof existingAccount.dm === "object" && existingAccount.dm ? existingAccount.dm : {},
     };
 
     // 4. 提示 DM 访问策略

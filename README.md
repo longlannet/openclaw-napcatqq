@@ -2,7 +2,7 @@
 
 OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCatQQ)（OneBot v11 WebSocket）对接 QQ。
 
-与官方 Telegram / Discord / 飞书等通道插件完全对齐，实现了 OpenClaw ChannelPlugin SDK 的全部 14 个适配器 + 10 个消息 Action。
+整体设计对齐 OpenClaw ChannelPlugin SDK，当前已实现核心通道适配能力与 6 个消息 Action。
 
 ## 功能
 
@@ -22,7 +22,7 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 - ✅ Markdown 感知的长消息自动切分（4000 字符限制）
 - ✅ Typing 输入状态指示（私聊显示"正在输入"，NapCat `set_input_status` API）
 
-### 消息 Action（10 个）
+### 消息 Action（6 个）
 
 | Action | 说明 |
 |--------|------|
@@ -63,7 +63,7 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 - ✅ 启动时预加载已批准群的历史消息（`get_group_msg_history`）
 - ✅ 消息防抖合并（连续多条消息合并为一条处理）
 - ✅ Agent 信封格式（`发送者@群名`，含时间戳）
-- ✅ 群聊工具权限策略
+- ⚠️ 群聊工具权限策略目前未做独立实现（当前 `resolveToolPolicy()` 返回 `undefined`）
 
 ### 连接与管理
 
@@ -88,7 +88,7 @@ OpenClaw 通道插件 —— 通过 [NapCatQQ](https://github.com/NapNeko/NapCat
 | 引用回复 | ✅ |
 | 媒体（图片/语音/视频/文件） | ✅ |
 | 表情回应 | ✅ |
-| 撤回消息 | ✅ |
+| 撤回消息 | ❌（当前未对外暴露 action） |
 | 消息编辑 | ❌（QQ 协议不支持） |
 | 投票 | ❌ |
 | 消息线程 | ❌ |
@@ -187,7 +187,7 @@ openclaw gateway restart
 | `commandPrefix` | string | `"/"` | 命令前缀 |
 | `defaultTo` | string | — | 默认发送目标（message 工具省略 target 时使用） |
 | `groupPolicy` | string | `"disabled"` | 群聊策略：`disabled` / `open` / `allowlist` / `pairing` |
-| `groupAllowFrom` | array | — | 群聊白名单（`g群号` 或纯群号或 QQ 号） |
+| `groupAllowFrom` | array | — | 群聊白名单（`g群号` 或纯群号） |
 | `historyLimit` | number | `50` | 群聊历史消息缓存条数上限 |
 | `allowFrom` | array | — | 管理员/白名单 QQ 号列表 |
 | `autoAcceptFriend` | boolean | `false` | 自动同意好友请求（关闭时仅通知管理员） |
@@ -391,7 +391,7 @@ location / {
 
 ## SDK 适配器清单
 
-插件实现了 OpenClaw ChannelPlugin 全部 14 个适配器：
+插件当前实现了 OpenClaw ChannelPlugin 的核心适配器集合：
 
 | 适配器 | 功能 |
 |--------|------|
@@ -403,13 +403,13 @@ location / {
 | `setup` | 快捷配置（`openclaw channels add`） |
 | `security` | DM 策略、安全警告检测 |
 | `pairing` | 配对认证（idLabel、审批通知） |
-| `groups` | 群聊 mention 策略、工具权限 |
+| `groups` | 群聊 mention 策略（工具权限当前未单独实现） |
 | `directory` | 联系人/群列表（`get_friend_list` / `get_group_list`） |
 | `messaging` | 目标解析、格式化显示 |
-| `threading` | 线程/引用回复模式 |
+| `threading` | 无线程；但支持显式引用回复标签 |
 | `outbound` | 出站消息发送（文本/图片/语音/视频/文件/chunker） |
 | `status` | 连接状态、bot 信息、问题诊断 |
-| `gateway` | WS 长连接管理（start/stop/logout/probe） |
+| `gateway` | WS 长连接管理（start/stop/probe；logout 仅清连接凭据） |
 
 ## 文件结构
 
@@ -432,7 +432,7 @@ openclaw-napcatqq/
     ├── onboarding.ts           # 向导式配置 + Setup 适配器（10 步）
     ├── gateway.ts              # WS 长连接管理（事件路由 / 通知处理 / 请求处理 / 历史预加载）
     ├── handler.ts              # 入站消息处理（访问控制 / 音频下载 / 上下文构建 / 回复分发）
-    └── channel.ts              # 通道胶水层（meta / capabilities / 10 actions / outbound / status + 导出）
+    └── channel.ts              # 通道胶水层（meta / capabilities / 6 actions / outbound / status + 导出）
 ```
 
 ## 协议

@@ -30,6 +30,29 @@ export function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): 
   const id = normalizeAccountId(accountId ?? DEFAULT_ACCOUNT_ID);
   const accounts = getAccountsRecord(cfg);
   const raw = (accounts[id] ?? {}) as Record<string, unknown>;
+  const dmRaw = (raw.dm && typeof raw.dm === "object" && !Array.isArray(raw.dm))
+    ? raw.dm as Record<string, unknown>
+    : undefined;
+  const dmPolicy = dmRaw?.policy;
+  const normalizedDmPolicy = dmPolicy === "pairing" || dmPolicy === "open" || dmPolicy === "closed"
+    ? dmPolicy
+    : undefined;
+  const normalizedDmAllowFrom = Array.isArray(dmRaw?.allowFrom)
+    ? dmRaw?.allowFrom as Array<string | number>
+    : undefined;
+  const rawGroupPolicy = raw.groupPolicy;
+  const normalizedGroupPolicy = rawGroupPolicy === "disabled" || rawGroupPolicy === "open" || rawGroupPolicy === "allowlist" || rawGroupPolicy === "pairing"
+    ? rawGroupPolicy
+    : "disabled";
+  const normalizedAllowFrom = Array.isArray(raw.allowFrom)
+    ? raw.allowFrom as Array<string | number>
+    : undefined;
+  const normalizedGroupAllowFrom = Array.isArray(raw.groupAllowFrom)
+    ? raw.groupAllowFrom as Array<string | number>
+    : undefined;
+  const normalizedHistoryLimit = typeof raw.historyLimit === "number" && Number.isFinite(raw.historyLimit)
+    ? raw.historyLimit
+    : undefined;
   return {
     accountId: id,
     enabled: raw.enabled !== false,
@@ -38,11 +61,14 @@ export function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): 
     selfId: raw.selfId as string | undefined,
     requireMention: raw.requireMention !== false,      // 默认群聊需要 @
     commandPrefix: (raw.commandPrefix as string) ?? "/",
-    allowFrom: raw.allowFrom as Array<string | number> | undefined,
-    groupPolicy: raw.groupPolicy as NapCatAccountConfig["groupPolicy"],
-    groupAllowFrom: raw.groupAllowFrom as Array<string | number> | undefined,
-    historyLimit: raw.historyLimit as number | undefined,
-    dm: raw.dm as NapCatAccountConfig["dm"],
+    allowFrom: normalizedAllowFrom,
+    groupPolicy: normalizedGroupPolicy,
+    groupAllowFrom: normalizedGroupAllowFrom,
+    historyLimit: normalizedHistoryLimit,
+    dm: dmRaw ? {
+      policy: normalizedDmPolicy,
+      allowFrom: normalizedDmAllowFrom,
+    } : undefined,
     // v0.5 新增
     autoAcceptFriend: raw.autoAcceptFriend as boolean | undefined,
     autoAcceptGroupInvite: raw.autoAcceptGroupInvite as boolean | undefined,

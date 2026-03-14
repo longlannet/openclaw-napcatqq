@@ -49,7 +49,7 @@ export const configSchema: ChannelConfigSchema = {
               type: "array",
               items: { oneOf: [{ type: "string" }, { type: "number" }] },
             },
-            historyLimit: { type: "number" },
+            historyLimit: { type: "number", minimum: 1, maximum: 500 },
             // ── v0.5 新增 ──
             autoAcceptFriend: { type: "boolean" },
             autoAcceptGroupInvite: { type: "boolean" },

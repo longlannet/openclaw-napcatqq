@@ -34,6 +34,33 @@ import { getNapCatRuntime } from "./runtime.js";
 import { CHANNEL_ID, resolveAccount } from "./config.js";
 import { handleInboundMessage, type HandlerContext } from "./handler.js";
 
+const configMutationQueues = new Map<string, Promise<void>>();
+
+async function enqueueConfigMutation(
+  accountId: string,
+  mutate: (cfg: any) => Promise<boolean | void> | boolean | void,
+): Promise<void> {
+  const core = getNapCatRuntime();
+  const prev = configMutationQueues.get(accountId) ?? Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(async () => {
+      const diskCfg = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
+      const changed = await mutate(diskCfg);
+      if (changed !== false) {
+        await core.config.writeConfigFile(diskCfg as OpenClawConfig);
+      }
+    });
+  configMutationQueues.set(accountId, next);
+  try {
+    await next;
+  } finally {
+    if (configMutationQueues.get(accountId) === next) {
+      configMutationQueues.delete(accountId);
+    }
+  }
+}
+
 export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
   startAccount: async (ctx: ChannelGatewayContext<NapCatAccountConfig>) => {
     const { cfg, accountId, account, runtime, log, abortSignal, getStatus, setStatus } = ctx;
@@ -61,15 +88,19 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
     const groupHistories = new Map<string, HistoryEntry[]>();
     // 群聊 pairing 已批准的群号（运行时内存 + 持久化到 groupAllowFrom）
     const approvedGroups = new Set<string>(
-      (account.groupAllowFrom ?? []).map(String).filter((e) => e.startsWith("g") || /^\d+$/.test(e)),
+      (account.groupAllowFrom ?? [])
+        .map(String)
+        .map((e) => e.startsWith("g") ? e.slice(1) : e)
+        .filter((e) => /^\d+$/.test(e)),
     );
-    // 群聊 pairing 已通知过的群号（防止重复通知）
-    const notifiedGroups = new Set<string>();
-    // owner QQ 号列表（热重载，每次从最新配置读取）
-    function getOwnerIds(): string[] {
+    // 群聊 pairing 已通知过的群号（带 TTL，防止刷屏也避免永久静默）
+    const notifiedGroups = new Map<string, number>();
+    const GROUP_PAIRING_NOTIFY_TTL_MS = 30 * 60 * 1000;
+    // 管理员 QQ 号列表（热重载，每次从最新配置读取）
+    function getAdminIds(): string[] {
       const latestCfg = getNapCatRuntime().config.loadConfig();
       const latestAccount = resolveAccount(latestCfg, accountId);
-      return [...(latestAccount.dm?.allowFrom ?? []), ...(latestAccount.allowFrom ?? [])].map(String).filter(Boolean);
+      return [...(latestAccount.allowFrom ?? [])].map(String).filter(Boolean);
     }
     const historyLimit = Math.max(
       1,
@@ -84,7 +115,7 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
       get selfId() { return selfId; },
       groupHistories,
       historyLimit,
-      getOwnerIds,
+      getOwnerIds: getAdminIds,
       log: log ? {
         info: (msg: string) => log.info(msg),
         warn: (msg: string) => log.warn(msg),
@@ -140,37 +171,39 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
             const gid = String(notice.group_id);
             log?.warn(`[napcatqq] Bot kicked from group ${gid}`);
             approvedGroups.delete(gid);
-            approvedGroups.delete(`g${gid}`);
             notifiedGroups.delete(gid);
 
             // 持久化移除（async fire-and-forget）
             void (async () => {
               try {
-                const core = getNapCatRuntime();
-                const diskCfg = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
-                const acctCfg = diskCfg?.channels?.napcatqq?.accounts?.[accountId];
-                if (acctCfg?.groupAllowFrom) {
-                  const before = acctCfg.groupAllowFrom.length;
-                  acctCfg.groupAllowFrom = acctCfg.groupAllowFrom.filter(
-                    (e: string | number) => String(e) !== gid && String(e) !== `g${gid}`,
-                  );
-                  if (acctCfg.groupAllowFrom.length < before) {
-                    await core.config.writeConfigFile(diskCfg as OpenClawConfig);
-                    log?.info(`[napcatqq] Removed group ${gid} from groupAllowFrom`);
+                let removed = false;
+                await enqueueConfigMutation(accountId, async (diskCfg) => {
+                  const acctCfg = diskCfg?.channels?.napcatqq?.accounts?.[accountId];
+                  if (acctCfg?.groupAllowFrom) {
+                    const before = acctCfg.groupAllowFrom.length;
+                    acctCfg.groupAllowFrom = acctCfg.groupAllowFrom.filter(
+                      (e: string | number) => String(e) !== gid && String(e) !== `g${gid}`,
+                    );
+                    removed = acctCfg.groupAllowFrom.length < before;
+                    return removed;
                   }
+                  return false;
+                });
+                if (removed) {
+                  log?.info(`[napcatqq] Removed group ${gid} from groupAllowFrom`);
                 }
               } catch (err) {
                 log?.warn(`[napcatqq] Failed to remove kicked group: ${String(err)}`);
               }
               // 通知管理员
-              for (const ownerId of getOwnerIds()) {
+              for (const ownerId of getAdminIds()) {
                 try {
                   await sendMessage(client, {
                     chatType: "direct",
                     userId: ownerId,
                     text: `⚠️ 机器人已被移出群 ${gid}，已自动从 groupAllowFrom 中移除。`,
                   });
-                } catch { /* ignore */ }
+                } catch (err) { log?.warn(`[napcatqq] failed to notify admin ${ownerId} about kick_me in group ${gid}: ${String(err)}`); }
               }
             })();
           }
@@ -186,14 +219,14 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
               const operatorId = notice.operator_id ? String(notice.operator_id) : "未知";
               log?.warn(`[napcatqq] Bot muted in group ${gid} for ${durationText} by ${operatorId}`);
               void (async () => {
-                for (const ownerId of getOwnerIds()) {
+                for (const ownerId of getAdminIds()) {
                   try {
                     await sendMessage(client, {
                       chatType: "direct",
                       userId: ownerId,
                       text: `⚠️ 机器人在群 ${gid} 被禁言\n时长: ${durationText}\n操作者: ${operatorId}`,
                     });
-                  } catch { /* ignore */ }
+                  } catch (err) { log?.warn(`[napcatqq] failed to notify admin ${ownerId} about group ban in ${gid}: ${String(err)}`); }
                 }
               })();
             }
@@ -204,14 +237,14 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
             const uid = String(notice.user_id);
             log?.info(`[napcatqq] New friend added: ${uid}`);
             void (async () => {
-              for (const ownerId of getOwnerIds()) {
+              for (const ownerId of getAdminIds()) {
                 try {
                   await sendMessage(client, {
                     chatType: "direct",
                     userId: ownerId,
                     text: `ℹ️ 新好友添加成功: ${uid}`,
                   });
-                } catch { /* ignore */ }
+                } catch (err) { log?.warn(`[napcatqq] failed to notify admin ${ownerId} about friend_add ${uid}: ${String(err)}`); }
               }
             })();
           }
@@ -227,7 +260,7 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
             const message = notice.message ? String(notice.message) : "";
             log?.warn(`[napcatqq] Bot offline: ${tag} ${message}`);
             void (async () => {
-              for (const ownerId of getOwnerIds()) {
+              for (const ownerId of getAdminIds()) {
                 try {
                   await sendMessage(client, {
                     chatType: "direct",
@@ -258,14 +291,14 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
                 if (ok) {
                   log?.info(`[napcatqq] Auto-accepted friend request from ${req.user_id}`);
                   // 通知管理员
-                  for (const ownerId of getOwnerIds()) {
+                  for (const ownerId of getAdminIds()) {
                     try {
                       await sendMessage(client, {
                         chatType: "direct",
                         userId: ownerId,
                         text: `ℹ️ 已自动同意好友请求: ${req.user_id}${req.comment ? ` (验证消息: ${req.comment})` : ""}`,
                       });
-                    } catch { /* ignore */ }
+                    } catch (err) { log?.warn(`[napcatqq] failed to notify admin ${ownerId} about auto-accepted friend ${req.user_id}: ${String(err)}`); }
                   }
                 } else {
                   log?.warn(`[napcatqq] Failed to accept friend request from ${req.user_id}`);
@@ -284,14 +317,14 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
                 if (ok) {
                   log?.info(`[napcatqq] Auto-accepted group invite to ${req.group_id}`);
                   // 通知管理员
-                  for (const ownerId of getOwnerIds()) {
+                  for (const ownerId of getAdminIds()) {
                     try {
                       await sendMessage(client, {
                         chatType: "direct",
                         userId: ownerId,
                         text: `ℹ️ 已自动同意入群邀请: 群${req.group_id} (邀请人: ${req.user_id})`,
                       });
-                    } catch { /* ignore */ }
+                    } catch (err) { log?.warn(`[napcatqq] failed to notify admin ${ownerId} about auto-accepted group invite ${req.group_id}: ${String(err)}`); }
                   }
                 } else {
                   log?.warn(`[napcatqq] Failed to accept group invite to ${req.group_id}`);
@@ -311,7 +344,14 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
           const textContent = typeof sentEvent.message === "string"
             ? sentEvent.message
             : Array.isArray(sentEvent.message)
-              ? sentEvent.message.filter((s: any) => s.type === "text").map((s: any) => s.data?.text ?? "").join("")
+              ? sentEvent.message.map((s: any) => {
+                  if (s.type === "text") return s.data?.text ?? "";
+                  if (s.type === "image") return "[图片]";
+                  if (s.type === "record") return "[语音消息]";
+                  if (s.type === "video") return "[视频消息]";
+                  if (s.type === "file") return `[文件:${s.data?.name ?? s.data?.file ?? "未知文件"}]`;
+                  return "";
+                }).join("")
               : sentEvent.raw_message ?? "";
 
           if (textContent.trim()) {
@@ -380,9 +420,9 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
             if ((gp === "allowlist" || gp === "pairing") && inbound.groupId) {
               const groupAllowFrom = (latestAccount.groupAllowFrom ?? []).map(String);
               const groupAllowed = groupAllowFrom.length === 0
-                ? (gp === "pairing" ? approvedGroups.has(inbound.groupId) || approvedGroups.has(`g${inbound.groupId}`) : false)
-                : groupAllowFrom.some((entry) => entry === "*" || entry === inbound.groupId || entry === `g${inbound.groupId}` || entry === inbound.senderId)
-                  || approvedGroups.has(inbound.groupId) || approvedGroups.has(`g${inbound.groupId}`);
+                ? (gp === "pairing" ? approvedGroups.has(inbound.groupId) : false)
+                : groupAllowFrom.some((entry) => entry === "*" || entry === inbound.groupId || entry === `g${inbound.groupId}`)
+                  || approvedGroups.has(inbound.groupId);
               if (!groupAllowed) {
                 // 不在白名单 — 记录历史
                 recordPendingHistoryEntryIfEnabled({
@@ -399,10 +439,11 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
                 evictOldHistoryKeys(groupHistories);
 
                 // pairing 模式 → 通知 owner 审批
-                if (gp === "pairing" && !notifiedGroups.has(inbound.groupId)) {
-                  notifiedGroups.add(inbound.groupId);
+                const lastNotifiedAt = notifiedGroups.get(inbound.groupId) ?? 0;
+                if (gp === "pairing" && Date.now() - lastNotifiedAt >= GROUP_PAIRING_NOTIFY_TTL_MS) {
+                  notifiedGroups.set(inbound.groupId, Date.now());
                   const groupLabel = inbound.raw.group_name || `群${inbound.groupId}`;
-                  const ownerIds = getOwnerIds();
+                  const ownerIds = getAdminIds();
                   if (ownerIds.length > 0) {
                     const hint = `🔔 新群请求加入\n\n群名: ${groupLabel}\n群号: ${inbound.groupId}\n来自: ${inbound.senderName} (${inbound.senderId})\n\n回复: 批准群 ${inbound.groupId}`;
                     void (async () => {
@@ -413,7 +454,7 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
                             userId: String(ownerId),
                             text: hint,
                           });
-                        } catch { /* ignore */ }
+                        } catch (err) { log?.warn(`[napcatqq] failed to notify admin ${ownerId} about group pairing ${inbound.groupId}: ${String(err)}`); }
                       }
                     })();
                   }
@@ -454,7 +495,7 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
           }
 
           // 私聊快捷命令：「批准群 xxx」
-          if (inbound.chatType === "direct" && getOwnerIds().includes(inbound.senderId)) {
+          if (inbound.chatType === "direct" && getAdminIds().includes(inbound.senderId)) {
             const approveMatch = inbound.text.match(/^批准群\s*(\d+)\s*$/);
             if (approveMatch) {
               const gid = approveMatch[1];
@@ -472,22 +513,22 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
                 return;
               }
               approvedGroups.add(gid);
-              approvedGroups.add(`g${gid}`);
               notifiedGroups.delete(gid);
 
               // 持久化 + 通知（async fire-and-forget）
               void (async () => {
                 try {
-                  const core = getNapCatRuntime();
-                  const latestCfg2 = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
-                  const acctCfg = latestCfg2.channels?.napcatqq?.accounts?.[accountId];
-                  if (acctCfg) {
-                    const existing = (acctCfg.groupAllowFrom ?? []).map(String);
-                    if (!existing.includes(`g${gid}`) && !existing.includes(gid)) {
-                      acctCfg.groupAllowFrom = [...existing, `g${gid}`];
-                      await core.config.writeConfigFile(latestCfg2 as OpenClawConfig);
+                  await enqueueConfigMutation(accountId, async (latestCfg2) => {
+                    const acctCfg = latestCfg2.channels?.napcatqq?.accounts?.[accountId];
+                    if (acctCfg) {
+                      const existing = (acctCfg.groupAllowFrom ?? []).map(String);
+                      if (!existing.includes(`g${gid}`) && !existing.includes(gid)) {
+                        acctCfg.groupAllowFrom = [...existing, `g${gid}`];
+                        return true;
+                      }
                     }
-                  }
+                    return false;
+                  });
                 } catch (err) {
                   log?.warn(`[napcatqq] Failed to persist group approval: ${String(err)}`);
                 }
@@ -509,18 +550,19 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
               const uid = approveUserMatch[1];
               void (async () => {
                 try {
-                  const core = getNapCatRuntime();
-                  const latestCfg2 = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
-                  const acctCfg = latestCfg2.channels?.napcatqq?.accounts?.[accountId];
-                  if (acctCfg) {
-                    // 写入 dm.allowFrom（与 dm.policy=pairing 配合）
-                    acctCfg.dm ??= {};
-                    const existing = (acctCfg.dm.allowFrom ?? acctCfg.allowFrom ?? []).map(String);
-                    if (!existing.includes(uid)) {
-                      acctCfg.dm.allowFrom = [...existing, uid];
-                      await core.config.writeConfigFile(latestCfg2 as OpenClawConfig);
+                  await enqueueConfigMutation(accountId, async (latestCfg2) => {
+                    const acctCfg = latestCfg2.channels?.napcatqq?.accounts?.[accountId];
+                    if (acctCfg) {
+                      // 写入 dm.allowFrom（与 dm.policy=pairing 配合）
+                      acctCfg.dm ??= {};
+                      const existing = (acctCfg.dm.allowFrom ?? []).map(String);
+                      if (!existing.includes(uid)) {
+                        acctCfg.dm.allowFrom = [...existing, uid];
+                        return true;
+                      }
                     }
-                  }
+                    return false;
+                  });
                   log?.info(`[napcatqq] user ${uid} approved by ${inbound.senderId}`);
                   await sendMessage(client, {
                     chatType: "direct",
@@ -614,7 +656,9 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
     void (async () => {
       // 等待连接建立（最多 10 秒）
       for (let i = 0; i < 20; i++) {
+        if (!clientActive || abortSignal.aborted) return;
         await new Promise((r) => setTimeout(r, 500));
+        if (!clientActive || abortSignal.aborted) return;
         try {
           const info = await getLoginInfo(client);
           if (info) {
@@ -629,51 +673,52 @@ export const gateway: ChannelGatewayAdapter<NapCatAccountConfig> = {
             // 启动后一次性同步：selfId 回写 + pairing store → dm.allowFrom
             try {
               const core = getNapCatRuntime();
-              const diskCfg = JSON.parse(JSON.stringify(core.config.loadConfig())) as any;
-              const acctCfg = diskCfg?.channels?.napcatqq?.accounts?.[accountId];
-              if (acctCfg) {
-                let needsWrite = false;
+              const pairingAccess = createScopedPairingAccess({
+                core,
+                channel: CHANNEL_ID,
+                accountId,
+              });
+              const storeAllowFrom = await readStoreAllowFromForDmPolicy({
+                provider: CHANNEL_ID,
+                accountId: pairingAccess.accountId,
+                dmPolicy: "pairing",
+                readStore: pairingAccess.readStoreForDmPolicy,
+              });
 
-                // 回写 selfId
-                if (info.userId && acctCfg.selfId !== info.userId) {
-                  acctCfg.selfId = info.userId;
-                  needsWrite = true;
-                  log?.info(`[napcatqq] selfId written to config: ${info.userId}`);
+              let syncedCount = 0;
+              await enqueueConfigMutation(accountId, async (latestCfgQueued) => {
+                const acctCfgQueued = latestCfgQueued?.channels?.napcatqq?.accounts?.[accountId];
+                if (!acctCfgQueued) return false;
+
+                let changed = false;
+                if (info.userId && acctCfgQueued.selfId !== info.userId) {
+                  acctCfgQueued.selfId = info.userId;
+                  changed = true;
                 }
 
-                // 同步 credentials pairing store 到 dm.allowFrom
-                const pairingAccess = createScopedPairingAccess({
-                  core,
-                  channel: CHANNEL_ID,
-                  accountId,
-                });
-                const storeAllowFrom = await readStoreAllowFromForDmPolicy({
-                  provider: CHANNEL_ID,
-                  accountId: pairingAccess.accountId,
-                  dmPolicy: "pairing",
-                  readStore: pairingAccess.readStoreForDmPolicy,
-                });
                 if (storeAllowFrom.length > 0) {
-                  acctCfg.dm ??= {};
-                  const existing = new Set((acctCfg.dm.allowFrom ?? []).map(String));
-                  const merged = [...existing];
-                  let added = 0;
+                  acctCfgQueued.dm ??= {};
+                  const existingQueued = new Set((acctCfgQueued.dm.allowFrom ?? []).map(String));
+                  const mergedQueued = [...existingQueued];
                   for (const id of storeAllowFrom) {
-                    if (!existing.has(id)) {
-                      merged.push(id);
-                      added++;
+                    if (!existingQueued.has(id)) {
+                      mergedQueued.push(id);
+                      syncedCount++;
+                      changed = true;
                     }
                   }
-                  if (added > 0) {
-                    acctCfg.dm.allowFrom = merged;
-                    needsWrite = true;
-                    log?.info(`[napcatqq] synced ${added} users from pairing store to dm.allowFrom`);
+                  if (syncedCount > 0) {
+                    acctCfgQueued.dm.allowFrom = mergedQueued;
                   }
                 }
+                return changed;
+              });
 
-                if (needsWrite) {
-                  await core.config.writeConfigFile(diskCfg as OpenClawConfig);
-                }
+              if (info.userId) {
+                log?.info(`[napcatqq] selfId synced to config: ${info.userId}`);
+              }
+              if (syncedCount > 0) {
+                log?.info(`[napcatqq] synced ${syncedCount} users from pairing store to dm.allowFrom`);
               }
             } catch (err) {
               log?.warn(`[napcatqq] Failed to sync config on startup: ${String(err)}`);

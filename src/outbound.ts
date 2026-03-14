@@ -2,7 +2,7 @@
 // 出站消息处理 — OpenClaw 回复 → NapCat API 调用
 // ============================================================
 
-import { readFileSync, existsSync, mkdtempSync, unlinkSync, rmdirSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, unlinkSync, rmdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -14,7 +14,9 @@ import { QQ_FACE_EMOJI_MAP } from "./inbound.js";
  * 如果是本地文件路径，读取并转成 base64:// 前缀（跨服务器兼容）。
  * 如果是 URL 或已经是 base64://，原样返回。
  */
-type ResolvedMedia = { file: string; name?: string; missingLocal?: boolean };
+type ResolvedMedia = { file: string; name?: string; missingLocal?: boolean; error?: string };
+
+const MAX_LOCAL_MEDIA_BYTES = 25 * 1024 * 1024;
 
 function resolveFileToBase64(filePath: string, kind?: "audio" | "video" | "image"): ResolvedMedia {
   // 兼容 MEDIA: 前缀
@@ -32,6 +34,10 @@ function resolveFileToBase64(filePath: string, kind?: "audio" | "video" | "image
   if (existsSync(normalized)) {
     let buf: Buffer;
     try {
+      const stat = statSync(normalized);
+      if (stat.size > MAX_LOCAL_MEDIA_BYTES) {
+        return { file: normalized, missingLocal: true, error: `Local media file too large: ${stat.size} > ${MAX_LOCAL_MEDIA_BYTES}` };
+      }
       buf = readFileSync(normalized);
     } catch {
       return { file: normalized, missingLocal: true };
@@ -100,7 +106,7 @@ export async function sendMessage(client: NapCatWsClient, opts: SendOptions): Pr
   if (opts.imageUrl) {
     const resolved = resolveFileToBase64(opts.imageUrl, "image");
     if (resolved.missingLocal) {
-      return { ok: false, error: `Local media file missing/unreadable: ${opts.imageUrl}` };
+      return { ok: false, error: resolved.error ?? `Local media file missing/unreadable: ${opts.imageUrl}` };
     }
     segments.push({
       type: "image",
@@ -119,12 +125,16 @@ export async function sendMessage(client: NapCatWsClient, opts: SendOptions): Pr
       const textParams: Record<string, unknown> = { message: [...segments] };
       if (opts.chatType === "group") textParams.group_id = Number(opts.groupId);
       else textParams.user_id = Number(opts.userId);
-      try { await client.callApi(textAction, textParams); } catch { /* ignore text send error */ }
+      try {
+        await client.callApi(textAction, textParams);
+      } catch (err) {
+        return { ok: false, error: `Failed to send text before voice: ${err instanceof Error ? err.message : String(err)}` };
+      }
       segments.length = 0; // 清空已发的文本段
     }
     const resolved = resolveFileToBase64(opts.voiceUrl, "audio");
     if (resolved.missingLocal) {
-      return { ok: false, error: `Local voice file missing/unreadable: ${opts.voiceUrl}` };
+      return { ok: false, error: resolved.error ?? `Local voice file missing/unreadable: ${opts.voiceUrl}` };
     }
     segments.push({
       type: "record",
@@ -142,12 +152,16 @@ export async function sendMessage(client: NapCatWsClient, opts: SendOptions): Pr
       const textParams: Record<string, unknown> = { message: [...segments] };
       if (opts.chatType === "group") textParams.group_id = Number(opts.groupId);
       else textParams.user_id = Number(opts.userId);
-      try { await client.callApi(textAction, textParams); } catch { /* ignore */ }
+      try {
+        await client.callApi(textAction, textParams);
+      } catch (err) {
+        return { ok: false, error: `Failed to send text before video: ${err instanceof Error ? err.message : String(err)}` };
+      }
       segments.length = 0;
     }
     const resolved = resolveFileToBase64(opts.videoUrl, "video");
     if (resolved.missingLocal) {
-      return { ok: false, error: `Local video file missing/unreadable: ${opts.videoUrl}` };
+      return { ok: false, error: resolved.error ?? `Local video file missing/unreadable: ${opts.videoUrl}` };
     }
     segments.push({
       type: "video",

@@ -2,7 +2,6 @@
 // NapCatQQ 入站消息处理器（handleInboundMessage）
 // ============================================================
 
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import {
   createTypingCallbacks,
   createReplyPrefixOptions,
@@ -24,7 +23,7 @@ import { sendMessage, getMessage, getFileUrl, setMsgEmojiLike, markPrivateMsgAsR
 import { getClient } from "./client-store.js";
 import { getNapCatRuntime } from "./runtime.js";
 import { CHANNEL_ID, resolveAccount } from "./config.js";
-import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
@@ -41,6 +40,47 @@ export interface HandlerContext {
   };
 }
 
+const MAX_AUDIO_DOWNLOAD_BYTES = 15 * 1024 * 1024;
+const MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024;
+const MAX_BASE64_FILE_BYTES = 25 * 1024 * 1024;
+
+function assertHttpUrl(input: string): URL {
+  const url = new URL(input);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`unsupported protocol: ${url.protocol}`);
+  }
+  return url;
+}
+
+async function fetchWithLimits(input: string, maxBytes: number): Promise<{ buffer: Buffer; contentType: string }> {
+  const url = assertHttpUrl(input);
+  const controller = new AbortController();
+  const fetchTimeout = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const contentLength = Number(resp.headers.get("content-length") ?? "0");
+    if (contentLength > 0 && contentLength > maxBytes) {
+      throw new Error(`payload too large: ${contentLength} > ${maxBytes}`);
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length > maxBytes) {
+      throw new Error(`payload too large after download: ${buf.length} > ${maxBytes}`);
+    }
+    return {
+      buffer: buf,
+      contentType: resp.headers.get("content-type")?.split(";")[0].trim() || "application/octet-stream",
+    };
+  } finally {
+    clearTimeout(fetchTimeout);
+  }
+}
+
 export async function handleInboundMessage(
   inbound: NormalizedInbound,
   hctx: HandlerContext,
@@ -48,6 +88,9 @@ export async function handleInboundMessage(
   const { accountId, selfId, groupHistories, historyLimit, getOwnerIds, log } = hctx;
   const core = getNapCatRuntime();
   const client = getClient(accountId);
+  const tempFilesToCleanup: string[] = [];
+  const rawText = inbound.text;
+  let enrichedText = rawText;
 
   // 获取最新配置（支持热重载）
   const latestCfg = core.config.loadConfig();
@@ -71,9 +114,13 @@ export async function handleInboundMessage(
   // 2b. 标记已读（fire-and-forget）
   if (client) {
     if (inbound.chatType === "group" && inbound.groupId) {
-      void markGroupMsgAsRead(client, inbound.groupId).catch(() => {});
+      void markGroupMsgAsRead(client, inbound.groupId).catch((err) => {
+        log?.warn(`[napcatqq] markGroupMsgAsRead failed: ${String(err)}`);
+      });
     } else if (inbound.chatType === "direct") {
-      void markPrivateMsgAsRead(client, inbound.senderId).catch(() => {});
+      void markPrivateMsgAsRead(client, inbound.senderId).catch((err) => {
+        log?.warn(`[napcatqq] markPrivateMsgAsRead failed: ${String(err)}`);
+      });
     }
   }
 
@@ -81,7 +128,9 @@ export async function handleInboundMessage(
   const emojiAckEnabled = acct.emojiAck === true;
   if (emojiAckEnabled && client) {
     // 66 = 爱心，表示"收到/处理中"
-    void setMsgEmojiLike(client, inbound.messageId, "66").catch(() => {});
+    void setMsgEmojiLike(client, inbound.messageId, "66").catch((err) => {
+      log?.warn(`[napcatqq] setMsgEmojiLike failed: ${String(err)}`);
+    });
   }
 
   // 3. DM/群聊 访问控制
@@ -148,9 +197,11 @@ export async function handleInboundMessage(
               userId: inbound.senderId,
               text: `⏳ 你的消息已收到，需要管理员批准后才能对话，请稍候。`,
             });
-          } catch { /* ignore send error */ }
+          } catch (err) {
+            log?.warn(`[napcatqq] failed to notify requester about pairing wait state: ${String(err)}`);
+          }
           // 通知管理员
-          const preview = inbound.text.replace(/\s+/g, " ").slice(0, 100);
+          const preview = rawText.replace(/\s+/g, " ").slice(0, 100);
           const ownerHint = `🔔 新用户请求私聊\n\n昵称: ${inbound.senderName}\nQQ号: ${inbound.senderId}\n消息: ${preview}\n\n回复: 批准用户 ${inbound.senderId}`;
           for (const ownerId of getOwnerIds()) {
             if (ownerId === inbound.senderId) continue; // 不通知自己
@@ -160,7 +211,9 @@ export async function handleInboundMessage(
                 userId: ownerId,
                 text: ownerHint,
               });
-            } catch { /* ignore */ }
+            } catch (err) {
+              log?.warn(`[napcatqq] failed to notify admin ${ownerId} about pairing request: ${String(err)}`);
+            }
           }
         }
       }
@@ -171,10 +224,10 @@ export async function handleInboundMessage(
 
   // 4. 命令权限
   const ownerAllowed = resolveAllowlistMatchSimple({
-    allowFrom: access.effectiveAllowFrom,
+    allowFrom: (acct.allowFrom ?? []).map(String),
     senderId: inbound.senderId,
   }).allowed;
-  const hasControlCmd = core.channel.text.hasControlCommand(inbound.text, latestCfg);
+  const hasControlCmd = core.channel.text.hasControlCommand(rawText, latestCfg);
   const commandGate = resolveControlCommandGate({
     useAccessGroups: false,
     authorizers: [
@@ -206,21 +259,23 @@ export async function handleInboundMessage(
     mkdirSync(tmpDir, { recursive: true });
     for (const audioUrl of inbound.audioUrls.slice(0, 3)) {
       try {
-        const controller = new AbortController();
-        const fetchTimeout = setTimeout(() => controller.abort(), 30_000);
-        let resp;
-        try {
-          resp = await fetch(audioUrl, { signal: controller.signal });
-        } finally {
-          clearTimeout(fetchTimeout);
-        }
-        if (!resp.ok) continue;
-        const buf = Buffer.from(await resp.arrayBuffer());
-        const ext = (resp.headers.get("content-type") ?? "").includes("silk") ? ".silk" : ".amr";
+        const { buffer: buf, contentType } = await fetchWithLimits(audioUrl, MAX_AUDIO_DOWNLOAD_BYTES);
+        const ext = contentType.includes("silk")
+          ? ".silk"
+          : contentType.includes("ogg")
+            ? ".ogg"
+            : contentType.includes("wav")
+              ? ".wav"
+              : contentType.includes("mpeg") || contentType.includes("mp3")
+                ? ".mp3"
+                : contentType.includes("amr")
+                  ? ".amr"
+                  : ".bin";
         const tmpFile = `${tmpDir}/${Date.now()}-${randomBytes(4).toString("hex")}${ext}`;
         writeFileSync(tmpFile, buf);
         audioMediaPaths.push(tmpFile);
-        audioMediaTypes.push(resp.headers.get("content-type")?.split(";")[0].trim() || "audio/amr");
+        tempFilesToCleanup.push(tmpFile);
+        audioMediaTypes.push(contentType || "audio/amr");
         log?.info(`[napcatqq] audio downloaded: ${tmpFile} (${buf.length} bytes)`);
       } catch (err) {
         log?.warn(`[napcatqq] Failed to download audio: ${String(err)}`);
@@ -231,11 +286,11 @@ export async function handleInboundMessage(
   // 5b. 视频 URL（不下载，将 URL 信息附加给 Agent 参考）
   if (inbound.videoUrls.length > 0) {
     if (inbound.videoUrls.length === 1) {
-      inbound.text = inbound.text.replace("[视频消息]", `[视频消息: ${inbound.videoUrls[0]}]`);
+      enrichedText = enrichedText.replace("[视频消息]", `[视频消息: ${inbound.videoUrls[0]}]`);
     } else {
       // 多视频：替换所有 [视频消息] 为带序号和 URL 的版本
       let videoIdx = 0;
-      inbound.text = inbound.text.replace(/\[视频消息\]/g, () => {
+      enrichedText = enrichedText.replace(/\[视频消息\]/g, () => {
         const url = inbound.videoUrls[videoIdx] ?? "";
         videoIdx++;
         return url ? `[视频${videoIdx}: ${url}]` : `[视频${videoIdx}]`;
@@ -248,6 +303,7 @@ export async function handleInboundMessage(
     const client = getClient(accountId);
     for (const file of inbound.fileInfos) {
       let finalUrl = file.url;
+      let finalLabel = "URL";
       if (!finalUrl && file.fileId && client) {
         // 通过 API 请求文件数据
         const fileData = await getFileUrl(client, file.fileId, inbound.chatType, inbound.groupId);
@@ -257,24 +313,30 @@ export async function handleInboundMessage(
           } else if (fileData.base64) {
             // 如果 NapCat 返回了 base64 数据，直接在 OpenClaw 所在服务器落地为文件
             try {
+              const estimatedBytes = Math.floor(fileData.base64.length * 3 / 4);
+              if (estimatedBytes > MAX_BASE64_FILE_BYTES) {
+                throw new Error(`base64 file too large: ${estimatedBytes} > ${MAX_BASE64_FILE_BYTES}`);
+              }
               const fileTmpDir = resolvePreferredOpenClawTmpDir();
               const safeName = file.name.replace(/[^a-zA-Z0-9_.-]/g, '_');
               const localPath = join(fileTmpDir, `${Date.now()}_${safeName}`);
               writeFileSync(localPath, Buffer.from(fileData.base64, "base64"));
+              tempFilesToCleanup.push(localPath);
               finalUrl = `file://${localPath}`;
               log?.info(`[napcatqq] Wrote base64 file to local path: ${localPath}`);
             } catch (e) {
               log?.error(`[napcatqq] Failed to write base64 file: ${String(e)}`);
             }
           } else if (fileData.path) {
-            // 兜底：如果都没有，就把 NapCat 那边的绝对路径塞进去（虽然通常不在同一台机器，但聊胜于无）
-            finalUrl = fileData.path;
+            // 兜底：不要把 NapCat 本机路径伪装成 OpenClaw 可访问路径
+            finalUrl = `[NapCat-local-path:${fileData.path}]`;
+            finalLabel = "NapCat-local-path";
           }
         }
       }
       if (finalUrl) {
         const searchRegex = new RegExp(`\\[文件:\\s*${file.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s*\\([^)]+\\))?\\]`, 'g');
-        inbound.text = inbound.text.replace(searchRegex, `[文件: ${file.name} (URL: ${finalUrl})]`);
+        enrichedText = enrichedText.replace(searchRegex, `[文件: ${file.name} (${finalLabel}: ${finalUrl})]`);
         log?.info(`[napcatqq] Resolved file URL for ${file.name}: ${finalUrl}`);
       } else {
         log?.warn(`[napcatqq] File info missing URL: ${JSON.stringify(file)}`);
@@ -297,6 +359,8 @@ export async function handleInboundMessage(
         replyToBody = quoted.text || undefined;
         replyToSender = quoted.senderName || undefined;
         log?.info(`[napcatqq] reply context: sender=${quoted.senderName} textLen=${quoted.text.length}`);
+      } else {
+        log?.warn(`[napcatqq] failed to resolve quoted message: ${inbound.replyToMessageId}`);
       }
     }
   }
@@ -319,14 +383,14 @@ export async function handleInboundMessage(
     timestamp: new Date(),
     previousTimestamp,
     envelope: envelopeOptions,
-    body: inbound.text,
+    body: enrichedText,
     chatType: inbound.chatType,
     senderLabel: inbound.senderName,
   });
 
   // system event 入队（仅群聊 — Telegram 普通消息入站也不调此函数）
   if (isGroup) {
-    const preview = inbound.text.replace(/\s+/g, " ").slice(0, 160);
+    const preview = enrichedText.replace(/\s+/g, " ").slice(0, 160);
     const inboundLabel = `QQ message in ${groupName || `群${inbound.groupId}`} from ${inbound.senderName}`;
     core.system.enqueueSystemEvent(`${inboundLabel}: ${preview}`, {
       sessionKey: route.sessionKey,
@@ -376,10 +440,10 @@ export async function handleInboundMessage(
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: combinedBody,
-    BodyForAgent: inbound.text,
-    RawBody: inbound.text,
-    CommandBody: inbound.text,
-    BodyForCommands: inbound.text,
+    BodyForAgent: enrichedText,
+    RawBody: rawText,
+    CommandBody: rawText,
+    BodyForCommands: rawText,
     InboundHistory: inboundHistory,
     From: isGroup ? `qq-group:${inbound.groupId}` : `qq:${inbound.senderId}`,
     To: isGroup ? `qq-group:${inbound.groupId}` : `qq:${inbound.senderId}`,
@@ -530,14 +594,6 @@ export async function handleInboundMessage(
           }
           if (mediaDedupKey && mediaUrl) sentMediaInThisTurn.add(mediaDedupKey);
           log?.info(`[napcatqq] deliver: sent type=${isAudio ? "record" : (isVideo ? "video" : (mediaUrl ? "image" : "text"))} ok=${result.ok} msgId=${result.messageId}`);
-          
-          // 【增强 Agent 记忆】：将发送成功的消息 ID 通过系统事件告知 Agent，以便实现“撤回”等 Action
-          if (result.messageId) {
-            core.system.enqueueSystemEvent(`[系统提示] 你刚刚发送了一条消息，请记住该消息的 messageId: ${result.messageId} (若需撤回或回应，请使用此 ID)`, {
-              sessionKey: route.sessionKey,
-              contextKey: `napcatqq:outbound:${result.messageId}`,
-            });
-          }
         }
       },
       onError: (err, info) => {
@@ -550,22 +606,12 @@ export async function handleInboundMessage(
   if (inbound.imageUrls.length > 0) {
     for (const imgUrl of inbound.imageUrls.slice(0, 5)) { // 最多 5 张
       try {
-        const controller = new AbortController();
-        const fetchTimeout = setTimeout(() => controller.abort(), 30_000);
-        try {
-          const resp = await fetch(imgUrl, { signal: controller.signal });
-          if (resp.ok) {
-            const buf = Buffer.from(await resp.arrayBuffer());
-            const contentType = resp.headers.get("content-type") || "image/png";
-            inboundImages.push({
-              type: "image",
-              data: buf.toString("base64"),
-              mimeType: contentType.split(";")[0].trim(),
-            });
-          }
-        } finally {
-          clearTimeout(fetchTimeout);
-        }
+        const { buffer: buf, contentType } = await fetchWithLimits(imgUrl, MAX_IMAGE_DOWNLOAD_BYTES);
+        inboundImages.push({
+          type: "image",
+          data: buf.toString("base64"),
+          mimeType: contentType || "image/png",
+        });
       } catch (err) {
         log?.warn(`[napcatqq] Failed to download inbound image: ${String(err)}`);
       }
@@ -594,8 +640,8 @@ export async function handleInboundMessage(
   } catch (err) {
     log?.error(`[napcatqq] Failed to dispatch inbound: ${String(err)}`);
   } finally {
-    // 清理音频临时文件
-    for (const tmpFile of audioMediaPaths) {
+    // 清理临时文件（音频下载 / base64 落地文件）
+    for (const tmpFile of tempFilesToCleanup) {
       try { unlinkSync(tmpFile); } catch { /* ignore */ }
     }
   }

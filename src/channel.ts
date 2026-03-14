@@ -27,10 +27,10 @@ import {
   PAIRING_APPROVED_MESSAGE,
 } from "openclaw/plugin-sdk";
 import type { NapCatAccountConfig } from "./types.js";
-import { sendMessage, getLoginInfo, deleteMessage, uploadPrivateFile, uploadGroupFile, markPrivateMsgAsRead, markGroupMsgAsRead, getGroupMemberInfo, setEssenceMsg, deleteEssenceMsg } from "./outbound.js";
+import { sendMessage, getLoginInfo, uploadPrivateFile, uploadGroupFile, markPrivateMsgAsRead, markGroupMsgAsRead, getGroupMemberInfo } from "./outbound.js";
 import { getClient, requireClient } from "./client-store.js";
 import { getNapCatRuntime } from "./runtime.js";
-import { CHANNEL_ID, listAccountIds, resolveAccount, getAccountsRecord, config } from "./config.js";
+import { CHANNEL_ID, listAccountIds, resolveAccount, config } from "./config.js";
 import { configSchema } from "./config-schema.js";
 import { onboarding, setup } from "./onboarding.js";
 import { gateway } from "./gateway.js";
@@ -71,7 +71,10 @@ const capabilities: ChannelCapabilities = {
 const security: ChannelSecurityAdapter<NapCatAccountConfig> = {
   resolveDmPolicy: ({ cfg, account }): ChannelSecurityDmPolicy => {
     const policy = account.dm?.policy ?? "pairing";
-    const allowFrom = account.dm?.allowFrom ?? account.allowFrom ?? [];
+    const allowFrom = [
+      ...(account.dm?.allowFrom ?? []),
+      ...(account.allowFrom ?? []),
+    ];
     return {
       policy,
       allowFrom,
@@ -83,7 +86,10 @@ const security: ChannelSecurityAdapter<NapCatAccountConfig> = {
   collectWarnings: ({ account }) => {
     const warnings: string[] = [];
     const policy = account.dm?.policy ?? "pairing";
-    const allowFrom = account.dm?.allowFrom ?? account.allowFrom ?? [];
+    const allowFrom = [
+      ...(account.dm?.allowFrom ?? []),
+      ...(account.allowFrom ?? []),
+    ];
     if (policy === "open" && (!allowFrom || allowFrom.length === 0)) {
       warnings.push(
         `- NapCatQQ (${account.accountId}): dm.policy="open" with no allowFrom — any QQ user can trigger the bot. Set dm.policy="pairing" or configure allowFrom.`,
@@ -211,8 +217,13 @@ const outbound: ChannelOutboundAdapter = {
     const client = requireClient(accountId);
 
     const to = ctx.to.replace(/^napcatqq:/i, "");
-    const isGroup = to.startsWith("g");
-    const targetId = isGroup ? to.slice(1) : to;
+    const normalizeTarget = messaging.normalizeTarget;
+    const normalizedTo = normalizeTarget ? normalizeTarget(to) : undefined;
+    if (!normalizedTo) {
+      throw new Error(`invalid target: ${ctx.to}`);
+    }
+    const isGroup = normalizedTo.startsWith("g");
+    const targetId = isGroup ? normalizedTo.slice(1) : normalizedTo;
 
     const result = await sendMessage(client, {
       chatType: isGroup ? "group" : "direct",
@@ -236,8 +247,13 @@ const outbound: ChannelOutboundAdapter = {
     const client = requireClient(accountId);
 
     const to = ctx.to.replace(/^napcatqq:/i, "");
-    const isGroup = to.startsWith("g");
-    const targetId = isGroup ? to.slice(1) : to;
+    const normalizeTarget = messaging.normalizeTarget;
+    const normalizedTo = normalizeTarget ? normalizeTarget(to) : undefined;
+    if (!normalizedTo) {
+      throw new Error(`invalid target: ${ctx.to}`);
+    }
+    const isGroup = normalizedTo.startsWith("g");
+    const targetId = isGroup ? normalizedTo.slice(1) : normalizedTo;
 
     // 检测媒体类型
     const mediaUrl = ctx.mediaUrl ?? "";
@@ -365,10 +381,16 @@ const actions: ChannelMessageActionAdapter = {
     // 表情回应
     if (ctx.action === "react") {
       const messageId = params.message_id ?? params.messageId;
-      const emoji = params.emoji ?? params.emoji_id ?? "76"; // 默认 👍 (ID=76)
+      const emoji = params.emoji_id ?? params.emoji ?? "76"; // 默认 👍 (QQ emoji ID=76)
       if (!messageId) {
         return {
           content: [{ type: "text" as const, text: "message_id required" }],
+          details: { ok: false },
+        };
+      }
+      if (!/^\d+$/.test(String(emoji))) {
+        return {
+          content: [{ type: "text" as const, text: "emoji / emoji_id must be a QQ emoji ID (numeric)" }],
           details: { ok: false },
         };
       }
@@ -398,6 +420,34 @@ const actions: ChannelMessageActionAdapter = {
           details: { ok: false },
         };
       }
+      const cleanedBuffer = buffer.replace(/\s+/g, "");
+      if (!/^[A-Za-z0-9+/=]+$/.test(cleanedBuffer)) {
+        return {
+          content: [{ type: "text" as const, text: "buffer must be valid base64" }],
+          details: { ok: false },
+        };
+      }
+      try {
+        const decoded = Buffer.from(cleanedBuffer, "base64");
+        if (decoded.length === 0 && cleanedBuffer.length > 0) {
+          throw new Error("empty decode result");
+        }
+        if (decoded.toString("base64").replace(/=+$/g, "") !== cleanedBuffer.replace(/=+$/g, "")) {
+          throw new Error("base64 roundtrip mismatch");
+        }
+      } catch {
+        return {
+          content: [{ type: "text" as const, text: "buffer must be valid base64" }],
+          details: { ok: false },
+        };
+      }
+      const estimatedBytes = Math.floor(cleanedBuffer.length * 3 / 4);
+      if (estimatedBytes > 25 * 1024 * 1024) {
+        return {
+          content: [{ type: "text" as const, text: "attachment too large (>25MB)" }],
+          details: { ok: false, estimatedBytes },
+        };
+      }
 
       const to = target.replace(/^napcatqq:/i, "");
       const isGroup = to.startsWith("g");
@@ -414,18 +464,29 @@ const actions: ChannelMessageActionAdapter = {
 
       // 同时发送 caption（如果有的话）
       const caption = String(params.caption ?? params.message ?? "");
+      let captionOk = true;
+      let captionError = "";
       if (ok && caption) {
-        await sendMessage(client, {
-          chatType: isGroup ? "group" : "direct",
-          userId: isGroup ? undefined : targetId,
-          groupId: isGroup ? targetId : undefined,
-          text: caption,
-        });
+        try {
+          const captionResult = await sendMessage(client, {
+            chatType: isGroup ? "group" : "direct",
+            userId: isGroup ? undefined : targetId,
+            groupId: isGroup ? targetId : undefined,
+            text: caption,
+          });
+          captionOk = captionResult.ok;
+          if (!captionResult.ok) {
+            captionError = String(captionResult.error ?? "caption send failed");
+          }
+        } catch (err) {
+          captionOk = false;
+          captionError = String(err);
+        }
       }
 
       return {
-        content: [{ type: "text" as const, text: ok ? `文件 ${filename} 已发送` : "文件发送失败" }],
-        details: { ok, filename },
+        content: [{ type: "text" as const, text: ok ? (caption && !captionOk ? `文件 ${filename} 已发送（caption 发送失败）` : `文件 ${filename} 已发送`) : "文件发送失败" }],
+        details: { ok, filename, captionOk, ...(captionError ? { captionError } : {}) },
       };
     }
 
@@ -439,8 +500,16 @@ const actions: ChannelMessageActionAdapter = {
         };
       }
       const to = target.replace(/^napcatqq:/i, "");
-      const isGroup = to.startsWith("g");
-      const targetId = isGroup ? to.slice(1) : to;
+      const normalizeTarget = messaging.normalizeTarget;
+      const normalizedTo = normalizeTarget ? normalizeTarget(to) : undefined;
+      if (!normalizedTo) {
+        return {
+          content: [{ type: "text" as const, text: "invalid target" }],
+          details: { ok: false },
+        };
+      }
+      const isGroup = normalizedTo.startsWith("g");
+      const targetId = isGroup ? normalizedTo.slice(1) : normalizedTo;
       const ok = isGroup
         ? await markGroupMsgAsRead(client, targetId)
         : await markPrivateMsgAsRead(client, targetId);
@@ -461,8 +530,16 @@ const actions: ChannelMessageActionAdapter = {
         };
       }
       const to = target.replace(/^napcatqq:/i, "");
-      const isGroup = to.startsWith("g");
-      const targetId = isGroup ? to.slice(1) : to;
+      const normalizeTarget = messaging.normalizeTarget;
+      const normalizedTo = normalizeTarget ? normalizeTarget(to) : undefined;
+      if (!normalizedTo) {
+        return {
+          content: [{ type: "text" as const, text: "invalid target" }],
+          details: { ok: false },
+        };
+      }
+      const isGroup = normalizedTo.startsWith("g");
+      const targetId = isGroup ? normalizedTo.slice(1) : normalizedTo;
       const result = await sendMessage(client, {
         chatType: isGroup ? "group" : "direct",
         userId: isGroup ? undefined : targetId,
@@ -480,15 +557,23 @@ const actions: ChannelMessageActionAdapter = {
       const target = String(params.target ?? params.to ?? "");
       const replyToId = String(params.replyTo ?? params.message_id ?? params.messageId ?? "");
       const text = String(params.message ?? params.text ?? "");
-      if (!target || !text) {
+      if (!target || !text || !replyToId) {
         return {
-          content: [{ type: "text" as const, text: "target and message required" }],
+          content: [{ type: "text" as const, text: "target, message, and replyTo/message_id required" }],
           details: { ok: false },
         };
       }
       const to = target.replace(/^napcatqq:/i, "");
-      const isGroup = to.startsWith("g");
-      const targetId = isGroup ? to.slice(1) : to;
+      const normalizeTarget = messaging.normalizeTarget;
+      const normalizedTo = normalizeTarget ? normalizeTarget(to) : undefined;
+      if (!normalizedTo) {
+        return {
+          content: [{ type: "text" as const, text: "invalid target" }],
+          details: { ok: false },
+        };
+      }
+      const isGroup = normalizedTo.startsWith("g");
+      const targetId = isGroup ? normalizedTo.slice(1) : normalizedTo;
       const result = await sendMessage(client, {
         chatType: isGroup ? "group" : "direct",
         userId: isGroup ? undefined : targetId,
@@ -504,11 +589,18 @@ const actions: ChannelMessageActionAdapter = {
 
     // 获取群成员信息
     if (ctx.action === "member-info") {
-      const groupId = String(params.groupId ?? params.group_id ?? "");
+      const rawGroupId = String(params.groupId ?? params.group_id ?? "");
+      const groupId = rawGroupId.replace(/^g/i, "");
       const userId = String(params.userId ?? params.user_id ?? params.target ?? "");
       if (!groupId || !userId) {
         return {
           content: [{ type: "text" as const, text: "groupId and userId required" }],
+          details: { ok: false },
+        };
+      }
+      if (!/^\d+$/.test(groupId)) {
+        return {
+          content: [{ type: "text" as const, text: "groupId must be numeric or g-prefixed numeric" }],
           details: { ok: false },
         };
       }

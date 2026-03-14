@@ -44,6 +44,32 @@ function formatFileSize(sizeStr: string): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function decodeCqValue(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&#91;/g, "[")
+    .replace(/&#93;/g, "]")
+    .replace(/&#44;/g, ",");
+}
+
+function pushTextPart(parts: string[], value: string): void {
+  const text = value.trim();
+  if (!text) return;
+  const needsNewline = text.startsWith("[") || text.startsWith("...") || text.startsWith("  ");
+  if (parts.length === 0) {
+    parts.push(text);
+    return;
+  }
+  const prev = parts[parts.length - 1] ?? "";
+  if (needsNewline) {
+    parts.push(`\n${text}`);
+  } else if (/\n$/.test(prev) || /\s$/.test(prev)) {
+    parts.push(text);
+  } else {
+    parts.push(` ${text}`);
+  }
+}
+
 export interface NormalizedInbound {
   chatId: string;           // "napcatqq:<qq号>" 或 "napcatqq:g<群号>"
   chatType: "direct" | "group";
@@ -118,21 +144,21 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
         case "image": {
           const url = seg.data.url || seg.data.file;
           if (url) imageUrls.push(url);
-          textParts.push(seg.data.summary ? `[图片: ${seg.data.summary}]` : "[图片]");
+          pushTextPart(textParts, seg.data.summary ? `[图片: ${seg.data.summary}]` : "[图片]");
           break;
         }
 
         case "record": {
           const url = seg.data.url || seg.data.file;
           if (url) audioUrls.push(url);
-          textParts.push("[语音消息]");
+          pushTextPart(textParts, "[语音消息]");
           break;
         }
 
         case "video": {
           const url = seg.data.url || seg.data.file;
           if (url) videoUrls.push(url);
-          textParts.push("[视频消息]");
+          pushTextPart(textParts, "[视频消息]");
           break;
         }
 
@@ -140,7 +166,7 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
           const name = seg.data.name || seg.data.file || "未知文件";
           const fileId = seg.data.file_id || undefined;
           fileInfos.push({ name, url: seg.data.url, fileId });
-          textParts.push(`[文件: ${name}]`);
+          pushTextPart(textParts, `[文件: ${name}]`);
           break;
         }
 
@@ -149,7 +175,7 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
             name: seg.data.fileName,
             size: seg.data.fileSize,
           });
-          textParts.push(`[文件: ${seg.data.fileName} (${formatFileSize(seg.data.fileSize)})]`);
+          pushTextPart(textParts, `[文件: ${seg.data.fileName} (${formatFileSize(seg.data.fileSize)})]`);
           break;
         }
 
@@ -189,16 +215,16 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
             const desc = jsonData?.meta?.detail_1?.desc || jsonData?.meta?.news?.desc || jsonData?.prompt;
             if (desc) summary = `[卡片: ${desc}]`;
           } catch { /* 解析失败用默认 */ }
-          textParts.push(summary);
+          pushTextPart(textParts, summary);
           break;
         }
 
         case "xml":
-          textParts.push("[XML消息]");
+          pushTextPart(textParts, "[XML消息]");
           break;
 
         case "miniapp":
-          textParts.push("[小程序消息]");
+          pushTextPart(textParts, "[小程序消息]");
           break;
 
         // ---- 位置 ----
@@ -220,7 +246,7 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
 
         // ---- 合并转发 ----
         case "forward": {
-          textParts.push("[合并转发消息]");
+          pushTextPart(textParts, "[合并转发消息]");
           if (seg.data.content && Array.isArray(seg.data.content)) {
             const forwardMessages = seg.data.content as Array<any>;
             for (const fMsg of forwardMessages.slice(0, 5)) {
@@ -277,7 +303,7 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
       const paramMap: Record<string, string> = {};
       for (const kv of cqParams.split(",").filter(Boolean)) {
         const eq = kv.indexOf("=");
-        if (eq > 0) paramMap[kv.slice(0, eq)] = kv.slice(eq + 1);
+        if (eq > 0) paramMap[kv.slice(0, eq)] = decodeCqValue(kv.slice(eq + 1));
       }
 
       switch (cqType) {
@@ -288,22 +314,22 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
         case "image":
           if (paramMap.url) imageUrls.push(paramMap.url);
           else if (paramMap.file) imageUrls.push(paramMap.file);
-          textParts.push("[图片]");
+          pushTextPart(textParts, "[图片]");
           break;
         case "record":
           if (paramMap.url) audioUrls.push(paramMap.url);
-          textParts.push("[语音消息]");
+          pushTextPart(textParts, "[语音消息]");
           break;
         case "video":
           if (paramMap.url) videoUrls.push(paramMap.url);
-          textParts.push("[视频消息]");
+          pushTextPart(textParts, "[视频消息]");
           break;
         case "file": {
           const fname = paramMap.name || paramMap.file || "未知文件";
           const fileId = paramMap.file_id || undefined;
           if (paramMap.url) fileInfos.push({ name: fname, url: paramMap.url, fileId });
           else fileInfos.push({ name: fname, fileId });
-          textParts.push(`[文件: ${fname}]`);
+          pushTextPart(textParts, `[文件: ${fname}]`);
           break;
         }
         case "reply":
@@ -330,7 +356,7 @@ export function normalizeInbound(event: OneBotMessageEvent): NormalizedInbound {
     chatType: isGroup ? "group" : "direct",
     senderId: String(event.user_id),
     senderName: event.sender?.card || event.sender?.nickname || String(event.user_id),
-    text: textParts.join("").trim(),
+    text: textParts.join("").replace(/\n{3,}/g, "\n\n").trim(),
     messageId: String(event.message_id),
     replyToMessageId,
     imageUrls,
@@ -358,5 +384,5 @@ export function isMentioningBot(inbound: NormalizedInbound, selfId: string): boo
 export function stripBotMention(text: string, selfId: string): string {
   if (!selfId) return text;
   const escaped = escapeRegExp(selfId);
-  return text.replace(new RegExp("@" + escaped + "\s*", "g"), "").trim();
+  return text.replace(new RegExp("@" + escaped + "\\s*", "g"), "").trim();
 }
